@@ -47,6 +47,9 @@ services:
       # Gắn volume để lưu data. Nếu không có dòng này, mọi insert/update
       # sẽ mất sạch khi container restart.
       - mysql_data:/var/lib/mysql
+      # [MỚI] Mount seed data script vào thư mục init của MySQL
+      # Docker sẽ tự động chạy file này khi container được tạo lần đầu
+      - ./seed_data/mysql_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       # Mở port 3306 để bạn có thể dùng DBeaver/MySQL Workbench 
       # kết nối vào xem data test (chỉ dùng trong lab).
@@ -77,6 +80,8 @@ services:
     volumes:
       # Lưu trữ bền vững cho Data Warehouse.
       - postgres_data:/var/lib/postgresql/data
+      # [MỚI] Mount seed data script vào thư mục init của PostgreSQL
+      - ./seed_data/postgres_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       # Mở port 5432 để debug/check data sau khi ETL chạy.
       - "5432:5432"
