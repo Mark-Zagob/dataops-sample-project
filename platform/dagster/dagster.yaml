@@ -1,0 +1,36 @@
+# =================================================================
+# DAGSTER INSTANCE CONFIGURATION
+# =================================================================
+# File này định nghĩa cách Dagster lưu trữ trạng thái của các Run.
+# Trong Production thực tế, chúng ta sẽ dùng PostgreSQL để lưu trữ
+# (Run Storage, Event Log Storage) nhằm hỗ trợ HA và scale-out.
+# Tuy nhiên, trong Lab này, chúng ta dùng SQLite để đơn giản hóa.
+
+# Nơi lưu trữ lịch sử các lần chạy pipeline
+run_storage:
+  module: dagster.core.storage.runs
+  class: SqliteRunStorage
+  config:
+    base_dir: /opt/dagster/dagster_home/runs
+
+# Nơi lưu trữ event logs (chi tiết từng step)
+event_log_storage:
+  module: dagster.core.storage.event_log
+  class: SqliteEventLogStorage
+  config:
+    base_dir: /opt/dagster/dagster_home/event_logs
+
+# Nơi lưu trữ các schedules (lịch chạy tự động)
+schedule_storage:
+  module: dagster.core.storage.schedules
+  class: SqliteScheduleStorage
+  config:
+    base_dir: /opt/dagster/dagster_home/schedules
+
+# Run Launcher: Cách Dagster thực thi các pipeline
+# "DefaultRunLauncher" chạy pipeline trong cùng process với webserver.
+# Trong Production, chúng ta sẽ dùng "DockerRunLauncher" hoặc "K8sRunLauncher"
+# để mỗi pipeline chạy trong một container riêng biệt -> Blast Radius nhỏ hơn.
+run_launcher:
+  module: dagster.core.launcher
+  class: DefaultRunLauncher

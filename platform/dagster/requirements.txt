@@ -1,0 +1,14 @@
+# Dagster Core & UI
+dagster==1.9.2
+dagster-webserver==1.9.2
+dagster-postgres==0.26.2
+
+# Database Drivers
+pymysql==1.1.1          # MySQL connector (pure Python, dễ cài đặt)
+psycopg2-binary==2.9.9  # PostgreSQL connector
+
+# Data Processing
+pandas==2.2.2           # Xử lý và transform dữ liệu
+
+# Utilities
+python-dotenv==1.0.1    # Đọc file .env (chỉ dùng khi chạy local, không dùng trong Docker)

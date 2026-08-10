@@ -1,0 +1,20 @@
+# Secrets - TUYỆT ĐỐI KHÔNG COMMIT
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Dagster local storage
+/dagster_home/
+
+# Docker volumes (nếu có local bind mounts)
+mysql_data/
+postgres_data/

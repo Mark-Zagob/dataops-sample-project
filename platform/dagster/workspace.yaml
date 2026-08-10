@@ -1,0 +1,15 @@
+# =================================================================
+# DAGSTER WORKSPACE
+# =================================================================
+# File này nói cho Dagster biết: "Code của Data Engineer nằm ở đâu?"
+# Trong kiến trúc Production, chúng ta có thể có NHIỀU workspace
+# (mỗi team Data có một repo code riêng). Dagster sẽ load tất cả.
+
+load_from:
+  # Trỏ đến Python package "user_code"
+  # Dagster sẽ tìm file definitions.py bên trong package này
+  - python_package:
+      package_name: user_code
+      # working_directory giúp Dagster biết đường dẫn gốc để import
+      # Trong container, code được copy vào /opt/dagster/user_code
+      working_directory: /opt/dagster

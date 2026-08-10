@@ -1,0 +1,20 @@
+# Secrets không được phép vào Docker image
+.env
+
+# Git metadata không cần thiết trong image
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+.venv
+
+# IDE files
+.vscode
+.idea
+
+# Documentation không cần trong image
+*.md
+ARCHITECTURE.md
+README.md
