@@ -53,7 +53,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # -w: trỏ đến file workspace.yaml để Dagster biết nơi load code
 # -h 0.0.0.0: listen trên tất cả interfaces (cần thiết để Docker expose port ra ngoài)
 # -p 3000: port của Webserver
-CMD ["dagster-webserver", "run", \
+CMD ["dagster-webserver", \
      "-h", "0.0.0.0", \
      "-p", "3000", \
      "-w", "/opt/dagster/dagster_home/workspace.yaml"]
