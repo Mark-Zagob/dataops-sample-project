@@ -5,7 +5,7 @@
 # Không service nào bị lộ ra ngoài internet trừ khi chúng ta mở port.
 networks:
   dataops-network:
-    external: true
+    driver: bridge
 
 # =================================================================
 # VOLUMES: Lưu trữ bền vững cho Databases
@@ -56,7 +56,7 @@ services:
       # SRE LENS: Kiểm tra MySQL đã THỰC SỰ sẵn sàng chưa.
       # Lệnh này chạy bên trong container. Nếu exit code != 0, 
       # Docker sẽ đánh dấu container là "unhealthy".
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -85,7 +85,7 @@ services:
       - "5432:5432"
     healthcheck:
       # SRE LENS: pg_isready là lệnh chuẩn để check Postgres đã nhận kết nối chưa.
-      test: ["CMD-SHELL", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5

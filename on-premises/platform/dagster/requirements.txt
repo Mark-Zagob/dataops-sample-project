@@ -1,6 +1,6 @@
 # Dagster Core & UI
-dagster==1.9.2
-dagster-webserver==1.9.2
+dagster==1.10.2
+dagster-webserver==1.10.2
 dagster-postgres==0.26.2
 
 # Database Drivers
