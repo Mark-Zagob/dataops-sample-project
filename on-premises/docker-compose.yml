@@ -7,7 +7,7 @@ version: '3.8'
 # Không service nào bị lộ ra ngoài internet trừ khi chúng ta mở port.
 networks:
   dataops-network:
-    driver: bridge
+    external: true
 
 # =================================================================
 # VOLUMES: Lưu trữ bền vững cho Databases
