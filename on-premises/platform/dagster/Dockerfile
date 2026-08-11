@@ -21,16 +21,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Đây là kỹ thuật Docker Layer Caching:
 # Nếu requirements.txt không đổi, Docker sẽ dùng lại cache pip install
 # từ lần build trước, tiết kiệm rất nhiều thời gian.
-COPY platform/dagster/requirements.txt ./requirements.txt
+COPY ./platform/dagster/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy Dagster configuration files
-COPY platform/dagster/dagster.yaml ./dagster_home/dagster.yaml
-COPY platform/dagster/workspace.yaml ./dagster_home/workspace.yaml
+COPY ./platform/dagster/dagster.yaml ./dagster_home/dagster.yaml
+COPY ./platform/dagster/workspace.yaml ./dagster_home/workspace.yaml
 
 # Copy User Code (Production Mode: COPY, không mount volume)
 # Mọi thay đổi code đều yêu cầu build lại image để đảm bảo Immutability.
-COPY user_code/ ./user_code/
+COPY ./user_code/ ./user_code/
 
 # Tạo thư mục DAGSTER_HOME nếu chưa tồn tại
 # Đây là nơi Dagster lưu trữ run history, logs, schedules

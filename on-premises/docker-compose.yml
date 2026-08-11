@@ -100,7 +100,7 @@ services:
   dagster-platform:
     build:
       context: .                          # Build context là thư mục gốc project
-      dockerfile: platform/dagster/Dockerfile  # Đường dẫn đến Dockerfile
+      dockerfile: ./platform/dagster/Dockerfile  # Đường dẫn đến Dockerfile
     container_name: dataops-dagster-platform
     restart: always
     networks:
