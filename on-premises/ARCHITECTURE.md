@@ -45,44 +45,56 @@ Dự án này xây dựng một **Data Platform Self-serve** trên môi trườn
 ## 4. System Architecture (Kiến trúc hệ thống)
 
 ### 4.1. Component Diagram (Sơ đồ thành phần)
+```mermaid
+flowchart TB
+    subgraph CLIENT["🧑‍💻 CLIENT LAYER"]
+        C["Data Engineers, Analysts, CEO<br/>UI Access: localhost:3000"]
+    end
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     CLIENT LAYER                             │
-│              (Data Engineers, Analysts, CEO)                 │
-└────────────────────────────┬──────────────────────────────────┘
-                              │ (UI Access: localhost:3000)
-┌────────────────────────────▼──────────────────────────────────┐
-│               CONTROL PLANE (Dagster)                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐    │
-│  │  Webserver  │  │   Daemon    │  │   Run Launcher       │    │
-│  │  (Dagit UI) │  │ (Scheduler) │  │ (Execute Pipelines)  │    │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘    │
-└────────────────────────────┬──────────────────────────────────┘
-                              │ (Orchestrate)
-┌────────────────────────────▼──────────────────────────────────┐
-│               DATA PLANE (Processing)                         │
-│  ┌─────────────────────┐      ┌─────────────────────────┐     │
-│  │ Contract Validator  │──────│ ETL Engine (Staging)     │     │
-│  │ (Schema Check)      │      │ (Extract & Transform)    │     │
-│  └─────────────────────┘      └─────────────────────────┘     │
-└────────────────────────────┬──────────────────────────────────┘
-                              │ (Atomic Swap)
-┌────────────────────────────▼──────────────────────────────────┐
-│               STORAGE LAYER (PostgreSQL)                      │
-│  ┌─────────────────────┐      ┌─────────────────────────┐     │
-│  │  orders_staging      │      │  orders_production      │    │
-│  │  (Temporary)          │      │  (Live - CEO reads)     │    │
-│  └─────────────────────┘      └─────────────────────────┘     │
-└─────────────────────────────────────────────────────────────┘
-                              ▲
-                              │ (Read Data)
-┌────────────────────────────┴──────────────────────────────────┐
-│               SOURCE LAYER (MySQL)                             │
-│              (Transactional DB - Sales)                        │
-└─────────────────────────────────────────────────────────────┘
-```
+    subgraph CONTROL["🎛️ CONTROL PLANE (Dagster)"]
+        direction LR
+        subgraph WEB["Container 1: dagster-platform"]
+            W1["Webserver (UI)<br/>API Gateway<br/>Port 3000<br/><i>Role: Quầy lễ tân</i>"]
+        end
+        subgraph DAEMON["Container 2: dagster-daemon"]
+            D1["Daemon loop<br/>Run execution<br/>Schedules<br/>Sensors<br/><i>Role: Nhà máy</i>"]
+        end
+        STORE[("SQLite / PostgreSQL<br/>Instance Storage<br/>(runs, events, logs)")]
+        WEB --- STORE
+        DAEMON --- STORE
+    end
 
+    subgraph DATAPLANE["⚙️ DATA PLANE (Processing)"]
+        direction LR
+        VALIDATOR["Contract Validator<br/>(Schema Check)"]
+        ETL["ETL Engine (Staging)<br/>(Extract & Transform)"]
+        VALIDATOR --> ETL
+    end
+
+    subgraph STORAGE["🗄️ STORAGE LAYER (PostgreSQL)"]
+        direction LR
+        STAGING[("orders_staging<br/>(Temporary)")]
+        PROD[("orders_production<br/>(Live - CEO reads)")]
+        STAGING -- "Atomic Swap" --> PROD
+    end
+
+    subgraph SOURCE["🏭 SOURCE LAYER (MySQL)"]
+        MYSQL[("Transactional DB - Sales")]
+    end
+
+    CLIENT --> CONTROL
+    CONTROL -- "Orchestrate" --> DATAPLANE
+    DATAPLANE --> STORAGE
+    MYSQL -- "Read Data" --> DATAPLANE
+```
+> **Tách Webserver và Daemon thành 2 container là quyết định production-grade:**
+> - **Blast radius nhỏ hơn**: restart UI không ảnh hưởng runs đang chạy.
+> - **Scale độc lập**: có thể chạy 1 webserver + N daemon (tuy nhiên lab này chỉ cần 1–1).
+> - **Healthcheck riêng biệt**: webserver cần probe HTTP, daemon cần probe heartbeat khác.
+> - **Migrate K8s dễ dàng**: mỗi container tương ứng 1 Deployment độc lập.
+>
+> ⚠️ **Không chạy chung 2 process trong 1 container bằng supervisor**: vi phạm
+> nguyên tắc "one process per container" và khiến Docker không thể quản lý lifecycle đúng.
 ### 4.2. Technology Stack
 
 | Layer | Technology | Justification (Tại sao chọn?) |
@@ -136,7 +148,25 @@ Dự án này xây dựng một **Data Platform Self-serve** trên môi trườn
 |--------------|------|------|--------------|------------|
 | `mysql-source` | Source DB | 3306 | `mysqladmin ping` | None |
 | `postgres-target` | Target DB | 5432 | `pg_isready` | None |
-| `dagster-platform` | Orchestrator + Processing | 3000 | HTTP check `/api` | `mysql-source` (healthy), `postgres-target` (healthy) |
+| `dagster-platform` | Dagster Webserver (UI + API) | 3000 | HTTP check `/health` | `mysql-source` (healthy), `postgres-target` (healthy) |
+| `dagster-daemon` | Dagster Daemon (Run Execution) | — | Disabled* | `mysql-source` (healthy), `postgres-target` (healthy) |
+
+\* Daemon không expose HTTP endpoint, nên không có healthcheck HTTP. Thay vào đó, Dagster tự theo dõi heartbeat của daemon và cảnh báo trên UI tab **Deployment** nếu daemon ngừng heartbeat.
+
+#### Immutability Pattern: "Same Image, Different Command"
+
+Hai service `dagster-platform` và `dagster-daemon` được build từ **cùng một Dockerfile**,
+chỉ khác nhau ở `command`:
+
+| Service           | Command                                                          |
+|-------------------|------------------------------------------------------------------|
+| dagster-platform  | `dagster-webserver -h 0.0.0.0 -p 3000 -w .../workspace.yaml`    |
+| dagster-daemon    | `dagster-daemon run -w .../workspace.yaml`                       |
+
+**Lợi ích:**
+- Artifact duy nhất (một image), giảm attack surface và storage.
+- Đảm bảo cả 2 process dùng cùng version code, cùng dependencies → không có version drift.
+- Khi migrate sang K8s, chỉ cần tạo 2 Deployment dùng cùng `image:tag`, override `command` ở từng nơi.
 
 ### 6.2. Networking & Security
 
@@ -171,6 +201,38 @@ Dự án này xây dựng một **Data Platform Self-serve** trên môi trườn
 - Nếu Atomic Swap fail giữa chừng: Transaction bị rollback. Bảng Production không bị ảnh hưởng.
 - Nếu PostgreSQL Volume bị hỏng: Restore từ backup (cần thiết lập backup job riêng - ngoài phạm vi lab này).
 - Nếu Dagster Container crash: Docker restart tự động (`restart: always`). Các Run đang dang dở sẽ được đánh dấu failed và có thể Retry từ UI.
+
+### 7.4. Control Plane Health & Split-Brain Prevention
+
+Dagster Daemon sử dụng cơ chế **leader election bằng heartbeat** trên Instance Storage
+để ngăn chặn tình trạng nhiều daemon chạy đồng thời (split-brain).
+
+#### Cơ chế hoạt động
+1. Mỗi daemon process có một `daemon_id` duy nhất (UUID random).
+2. Daemon ghi heartbeat vào Instance Storage mỗi ~30 giây.
+3. Nếu một daemon khác thấy heartbeat của daemon lạ còn mới, nó sẽ **từ chối thực thi**
+   và ghi log cảnh báo: *"Another <X> daemon is still sending heartbeats."*
+4. Chỉ daemon đang giữ lock mới thực sự thực thi runs, schedules, sensors.
+
+#### Tình huống thường gặp trong lab
+
+| Tình huống | Hậu quả | Cách xử lý |
+|---|---|---|
+| Chạy `docker exec -d dagster-daemon run` thủ công | 2 daemon cùng chạy, tranh lock, log ERROR liên tục | `docker compose restart` container liên quan |
+| Xóa container nhưng không xóa volume | Heartbeat cũ còn tồn tại, daemon mới tưởng có đối thủ | Đợi 60s để heartbeat cũ timeout |
+| Instance storage corrupt | Daemon không thể ghi heartbeat, mọi runs queued | Restore từ backup (production) |
+
+#### SLI đề xuất cho Production
+
+| SLI | Ngưỡng alert |
+|---|---|
+| Daemon heartbeat freshness | > 2 phút không có heartbeat |
+| Time a run spends in `QUEUED` state | > 5 phút |
+| Number of active daemon processes | ≠ 1 (split-brain) |
+
+> 💡 **Bài học từ lab:** Shadow process tạo ra bởi `docker exec` là kẻ thù
+> của vận hành production. Luôn ưu tiên *recreate artifact* (build lại image,
+> recreate container) thay vì *mutate container đang chạy*.
 
 ---
 

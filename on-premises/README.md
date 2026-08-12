@@ -146,12 +146,15 @@ Lần đầu tiên chạy sẽ mất khoảng 3-5 phút để download base imag
 # Xem trạng thái các containers
 docker compose ps
 
-# Kết quả mong đợi: Tất cả services đều "Up (healthy)"
-# NAME                        STATUS
-# dataops-mysql-source        Up (healthy)
-# dataops-postgres-target     Up (healthy)
-# dataops-dagster-platform    Up (healthy)
-```
+| NAME                        | STATUS                     | Vai trò                                  |
+|-----------------------------|----------------------------|------------------------------------------|
+| dataops-mysql-source        | Up (healthy)               | Source DB                                |
+| dataops-postgres-target     | Up (healthy)               | Target DB                                |
+| dataops-dagster-platform    | Up (healthy)               | Dagster Webserver (UI)                   |
+| dataops-dagster-daemon      | Up                         | Dagster Daemon (thực thi runs)           |
+
+> 💡 Service `dagster-daemon` không có healthcheck HTTP vì nó không chạy
+> webserver. Docker chỉ báo `Up` (không có `(healthy)`), điều này là bình thường.
 
 ### Bước 5: Truy cập Dagster UI
 
@@ -165,12 +168,18 @@ Bạn sẽ thấy giao diện Dagster với 3 Assets trong group `orders_pipelin
 
 ### Bước 6: Chạy Pipeline đầu tiên
 
-1. Trong Dagster UI, vào tab **"Assets"** (biểu hình kim cương bên trái).
-2. Tìm group **"orders_pipeline"**.
-3. Click vào asset **"orders_production"** (asset cuối cùng).
-4. Bấm nút **"Materialize"** ở góc trên bên phải.
-5. Dagster sẽ tự động chạy theo thứ tự: `validate_orders_schema` → `orders_staging` → `orders_production`.
-6. Quan sát logs realtime trong UI.
+1. Trong Dagster UI, vào tab **Assets** ở sidebar trái.
+2. Chọn view **Asset Graph** (biểu tượng đồ thị, không phải view List).
+3. Bạn sẽ thấy 3 asset được nối với nhau:
+   `validate_orders_schema` → `orders_staging` → `orders_production`
+4. Click nút **"Materialize all"** ở góc trên bên phải.
+   > 💡 **Vì sao phải dùng "Materialize all"?**
+   > Nếu bạn click riêng vào `orders_production` và bấm `Materialize`,
+   > Dagster chỉ chạy asset đó và cảnh báo "upstream has not been materialized".
+   > Atomic Swap sẽ fail vì bảng staging chưa tồn tại.
+   > **"Materialize all" đảm bảo cả chuỗi chạy đúng thứ tự dependency.**
+5. Quan sát Run mới xuất hiện ở tab **Runs**. Click vào Run để xem 3 step
+   lần lượt chuyển sang trạng thái **Succeeded**.
 
 ✅ **Thành công khi bạn thấy:**
 
@@ -459,6 +468,51 @@ docker compose up --build -d
    docker exec -it dataops-postgres-target psql -U datawarehouse -d analytics_dwh -c "\dt"
 ```
 
+### Lỗi: Run stuck ở trạng thái "Queued" mãi mãi
+
+**Hiện tượng:** Bấm Materialize, Run được tạo nhưng không bao giờ chuyển sang Running. Tab **Deployment** có icon cảnh báo ⚠️ màu vàng.
+
+**Nguyên nhân:** Dagster Control Plane gồm 2 thành phần độc lập:
+
+- **Webserver** (`dagster-platform`): chỉ nhận yêu cầu từ UI và ghi run vào queue.
+- **Daemon** (`dagster-daemon`): vòng lặp nền lấy run từ queue ra để thực thi.
+
+Nếu thiếu Daemon, mọi run sẽ nằm trong queue vĩnh viễn.
+
+**Giải pháp:**
+
+1. Đảm bảo service `dagster-daemon` tồn tại trong `docker-compose.yml`.
+2. Kiểm tra logs daemon:
+
+```bash
+   docker compose logs dagster-daemon --tail=30
+```
+
+3. Kỳ vọng thấy các dòng heartbeat INFO, không có cảnh báo "Another daemon is still sending heartbeats".
+
+---
+
+### Lỗi: `'cryptography' package is required for caching_sha2_password`
+
+**Hiện tượng:** Asset `validate_orders_schema` fail ngay khi kết nối MySQL, các asset downstream không chạy.
+
+**Nguyên nhân:** MySQL 8 mặc định dùng auth plugin `caching_sha2_password`. PyMySQL (driver Python) cần thư viện `cryptography` để thực hiện handshake RSA trên kết nối non-TLS. Nếu `requirements.txt` thiếu package này, connect sẽ fail.
+
+**Giải pháp:**
+
+1. Kiểm tra `platform/dagster/requirements.txt` có dòng:
+
+```text
+   cryptography==42.0.8
+```
+
+2. Nếu thiếu, thêm vào và build lại image:
+
+```bash
+   docker compose up -d --build dagster-platform dagster-daemon
+```
+
+> ⚠️ **Không khuyến nghị** đổi MySQL user sang `mysql_native_password`. Plugin này đã deprecated từ MySQL 8.0 và bị gỡ ở MySQL 8.4. Sửa đúng là bổ sung dependency phía client.
 ---
 
 ## ❓ FAQ
