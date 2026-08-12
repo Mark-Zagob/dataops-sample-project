@@ -145,16 +145,16 @@ Lần đầu tiên chạy sẽ mất khoảng 3-5 phút để download base imag
 ```bash
 # Xem trạng thái các containers
 docker compose ps
+```
 
-| NAME                        | STATUS                     | Vai trò                                  |
-|-----------------------------|----------------------------|------------------------------------------|
-| dataops-mysql-source        | Up (healthy)               | Source DB                                |
-| dataops-postgres-target     | Up (healthy)               | Target DB                                |
-| dataops-dagster-platform    | Up (healthy)               | Dagster Webserver (UI)                   |
-| dataops-dagster-daemon      | Up                         | Dagster Daemon (thực thi runs)           |
+| NAME | STATUS | Vai trò |
+|---|---|---|
+| `dataops-mysql-source` | Up (healthy) | Source DB |
+| `dataops-postgres-target` | Up (healthy) | Target DB |
+| `dataops-dagster-platform` | Up (healthy) | Dagster Webserver (UI) |
+| `dataops-dagster-daemon` | Up | Dagster Daemon (thực thi runs) |
 
-> 💡 Service `dagster-daemon` không có healthcheck HTTP vì nó không chạy
-> webserver. Docker chỉ báo `Up` (không có `(healthy)`), điều này là bình thường.
+> 💡 Service `dagster-daemon` không có healthcheck HTTP vì nó không chạy webserver. Docker chỉ báo `Up` (không có `(healthy)`), điều này là bình thường.
 
 ### Bước 5: Truy cập Dagster UI
 
@@ -173,17 +173,16 @@ Bạn sẽ thấy giao diện Dagster với 3 Assets trong group `orders_pipelin
 3. Bạn sẽ thấy 3 asset được nối với nhau:
    `validate_orders_schema` → `orders_staging` → `orders_production`
 4. Click nút **"Materialize all"** ở góc trên bên phải.
+
    > 💡 **Vì sao phải dùng "Materialize all"?**
-   > Nếu bạn click riêng vào `orders_production` và bấm `Materialize`,
-   > Dagster chỉ chạy asset đó và cảnh báo "upstream has not been materialized".
-   > Atomic Swap sẽ fail vì bảng staging chưa tồn tại.
+   > Nếu bạn click riêng vào `orders_production` và bấm `Materialize`, Dagster chỉ chạy asset đó và cảnh báo "upstream has not been materialized". Atomic Swap sẽ fail vì bảng staging chưa tồn tại.
    > **"Materialize all" đảm bảo cả chuỗi chạy đúng thứ tự dependency.**
-5. Quan sát Run mới xuất hiện ở tab **Runs**. Click vào Run để xem 3 step
-   lần lượt chuyển sang trạng thái **Succeeded**.
+
+5. Quan sát Run mới xuất hiện ở tab **Runs**. Click vào Run để xem 3 step lần lượt chuyển sang trạng thái **Succeeded**.
 
 ✅ **Thành công khi bạn thấy:**
 
-```
+```text
 ✅ Data Contract validation PASSED!
 ✅ Loaded 10 rows into orders_staging.
 ✅ Atomic Swap COMPLETED! Dữ liệu mới đã sẵn sàng cho CEO.
@@ -193,7 +192,7 @@ Bạn sẽ thấy giao diện Dagster với 3 Assets trong group `orders_pipelin
 
 ## 📁 Cấu trúc thư mục
 
-```
+```text
 dataops-lab/
 ├── README.md                       # File bạn đang đọc
 ├── ARCHITECTURE.md                 # Tài liệu kiến trúc chi tiết
