@@ -6,6 +6,7 @@ dagster-postgres==0.26.2
 # Database Drivers
 pymysql==1.1.1          # MySQL connector (pure Python, dễ cài đặt)
 psycopg2-binary==2.9.9  # PostgreSQL connector
+cryptography==42.0.8   # BẮT BUỘC: PyMySQL cần nó để auth caching_sha2_password (default của MySQL 8) trên kết nối non-TLS
 
 # Data Processing
 pandas==2.2.2           # Xử lý và transform dữ liệu
