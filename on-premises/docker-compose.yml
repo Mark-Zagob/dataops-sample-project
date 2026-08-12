@@ -151,3 +151,43 @@ services:
         condition: service_healthy
       postgres-target:
         condition: service_healthy
+  # ---------------------------------------------------------------
+  # 4. CONTROL PLANE: Dagster Daemon (background worker)
+  # ---------------------------------------------------------------
+  # Cùng image với dagster-platform, nhưng chạy command khác.
+  # Cùng image + khác command = immutability, artifact nhất quán.
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: ./platform/dagster/Dockerfile
+    container_name: dataops-dagster-daemon
+    restart: always
+    networks:
+      - dataops-network
+    environment:
+      # Daemon là nơi thực thi run (DefaultRunLauncher),
+      # nên nó cần cùng env DB và cùng user code như platform.
+      MYSQL_HOST: mysql-source
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_db}
+      MYSQL_USER: ${MYSQL_USER:-datauser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-datapassword}
+      POSTGRES_HOST: postgres-target
+      POSTGRES_PORT: 5432
+      POSTGRES_DATABASE: ${POSTGRES_DB:-analytics_dwh}
+      POSTGRES_USER: ${POSTGRES_USER:-datawarehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dwhpassword}
+      DAGSTER_HOME: /opt/dagster/dagster_home
+    volumes:
+      - dagster_storage:/opt/dagster/dagster_home
+    depends_on:
+      mysql-source:
+        condition: service_healthy
+      postgres-target:
+        condition: service_healthy
+    # HEALTHCHECK trong Dockerfile probe port 3000,
+    # nhưng daemon không chạy webserver -> phải disable,
+    # nếu không container sẽ bị gắn mác "unhealthy" oan.
+    healthcheck:
+      disable: true
+    command: ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]
