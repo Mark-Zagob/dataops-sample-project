@@ -578,7 +578,7 @@ A: Vào Dagster UI → Tab **"Runs"**. Tất cả lịch sử chạy, logs, th�
 ## 📚 Tài liệu tham khảo
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - Chi tiết kiến trúc và các quyết định thiết kế
-- [docs/reliability/mini-prr-orders-pipeline.md](mini-prr-orders-pipeline.md) - Mini-PRR cho orders pipeline
+- [mini-prr-orders-pipeline.md](./docs/reliability/mini-prr-orders-pipeline.md) - Mini-PRR cho orders pipeline
 - [Dagster Documentation](https://docs.dagster.io/)
 - [Docker Compose Specification](https://docs.docker.com/compose/)
 - DataOps Principles
