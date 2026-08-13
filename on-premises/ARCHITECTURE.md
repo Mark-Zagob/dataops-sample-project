@@ -184,6 +184,8 @@ chỉ khác nhau ở `command`:
 
 ## 7. Operational Readiness (Sẵn sàng vận hành)
 
+> Tham khảo Mini-PRR của từng pipeline trong [docs/reliability/](./docs/reliability/).
+
 ### 7.1. SLO / SLA Design
 
 - **Data Freshness:** 95% số ngày trong tháng, dữ liệu `orders_production` phải sẵn sàng trước **07:30 AM**.
