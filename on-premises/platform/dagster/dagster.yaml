@@ -1,36 +1,63 @@
 # =================================================================
 # DAGSTER INSTANCE CONFIGURATION
 # =================================================================
-# File này định nghĩa cách Dagster lưu trữ trạng thái của các Run.
-# Trong Production thực tế, chúng ta sẽ dùng PostgreSQL để lưu trữ
-# (Run Storage, Event Log Storage) nhằm hỗ trợ HA và scale-out.
-# Tuy nhiên, trong Lab này, chúng ta dùng SQLite để đơn giản hóa.
+# Production-grade lab:
+# - Run storage: PostgreSQL
+# - Event log storage: PostgreSQL
+# - Schedule storage: PostgreSQL
+#
+# Mục tiêu:
+# - Hỗ trợ concurrent access tốt hơn SQLite
+# - Dễ backup/restore metadata DB
+# - Phù hợp cho multi-user và vận hành production hơn
+# - Control Plane state được đặt trong một database riêng
+# =================================================================
 
-# Nơi lưu trữ lịch sử các lần chạy pipeline
 run_storage:
-  module: dagster.core.storage.runs
-  class: SqliteRunStorage
+  module: dagster_postgres.storage.runs
+  class: PostgresRunStorage
   config:
-    base_dir: /opt/dagster/dagster_home/runs
+    postgres_db:
+      hostname:
+        env: DAGSTER_METADATA_HOST
+      username:
+        env: DAGSTER_METADATA_USER
+      password:
+        env: DAGSTER_METADATA_PASSWORD
+      database:
+        env: DAGSTER_METADATA_DB
+      port: 5432
 
-# Nơi lưu trữ event logs (chi tiết từng step)
 event_log_storage:
-  module: dagster.core.storage.event_log
-  class: SqliteEventLogStorage
+  module: dagster_postgres.storage.event_log
+  class: PostgresEventLogStorage
   config:
-    base_dir: /opt/dagster/dagster_home/event_logs
+    postgres_db:
+      hostname:
+        env: DAGSTER_METADATA_HOST
+      username:
+        env: DAGSTER_METADATA_USER
+      password:
+        env: DAGSTER_METADATA_PASSWORD
+      database:
+        env: DAGSTER_METADATA_DB
+      port: 5432
 
-# Nơi lưu trữ các schedules (lịch chạy tự động)
 schedule_storage:
-  module: dagster.core.storage.schedules
-  class: SqliteScheduleStorage
+  module: dagster_postgres.storage.schedules
+  class: PostgresScheduleStorage
   config:
-    base_dir: /opt/dagster/dagster_home/schedules
+    postgres_db:
+      hostname:
+        env: DAGSTER_METADATA_HOST
+      username:
+        env: DAGSTER_METADATA_USER
+      password:
+        env: DAGSTER_METADATA_PASSWORD
+      database:
+        env: DAGSTER_METADATA_DB
+      port: 5432
 
-# Run Launcher: Cách Dagster thực thi các pipeline
-# "DefaultRunLauncher" chạy pipeline trong cùng process với webserver.
-# Trong Production, chúng ta sẽ dùng "DockerRunLauncher" hoặc "K8sRunLauncher"
-# để mỗi pipeline chạy trong một container riêng biệt -> Blast Radius nhỏ hơn.
 run_launcher:
   module: dagster.core.launcher
   class: DefaultRunLauncher

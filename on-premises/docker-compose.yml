@@ -1,17 +1,13 @@
 # =================================================================
 # NETWORKS: Tạo mạng nội bộ riêng biệt
 # =================================================================
-# Tất cả services sẽ giao tiếp với nhau qua mạng này.
-# Không service nào bị lộ ra ngoài internet trừ khi chúng ta mở port.
 networks:
   dataops-network:
     driver: bridge
 
 # =================================================================
-# VOLUMES: Lưu trữ bền vững cho Databases
+# VOLUMES: Lưu trữ bền vững cho Databases và Dagster state
 # =================================================================
-# Named volumes giúp dữ liệu không bị mất khi restart container.
-# Đây là yêu cầu BẮT BUỘC cho Stateful Services (DB).
 volumes:
   mysql_data:
     driver: local
@@ -19,14 +15,15 @@ volumes:
     driver: local
   dagster_storage:
     driver: local
+  dagster_metadata_data:
+    driver: local
 
 # =================================================================
 # SERVICES
 # =================================================================
 services:
-
   # ---------------------------------------------------------------
-  # 1. SOURCE LAYER: MySQL (Giả lập DB Kinh doanh)
+  # 1. SOURCE LAYER: MySQL
   # ---------------------------------------------------------------
   mysql-source:
     image: mysql:8.0
@@ -35,27 +32,16 @@ services:
     networks:
       - dataops-network
     environment:
-      # Trong production thực tế, KHÔNG hardcode password như thế này.
-      # Chúng ta sẽ dùng file .env (xem phần hướng dẫn bên dưới).
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_db}
       MYSQL_USER: ${MYSQL_USER:-datauser}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-datapassword}
     volumes:
-      # Gắn volume để lưu data. Nếu không có dòng này, mọi insert/update
-      # sẽ mất sạch khi container restart.
       - mysql_data:/var/lib/mysql
-      # [MỚI] Mount seed data script vào thư mục init của MySQL
-      # Docker sẽ tự động chạy file này khi container được tạo lần đầu
       - ./seed_data/mysql_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      # Mở port 3306 để bạn có thể dùng DBeaver/MySQL Workbench 
-      # kết nối vào xem data test (chỉ dùng trong lab).
       - "3306:3306"
     healthcheck:
-      # SRE LENS: Kiểm tra MySQL đã THỰC SỰ sẵn sàng chưa.
-      # Lệnh này chạy bên trong container. Nếu exit code != 0, 
-      # Docker sẽ đánh dấu container là "unhealthy".
       test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
       interval: 10s
       timeout: 10s
@@ -63,7 +49,7 @@ services:
       start_period: 600s
 
   # ---------------------------------------------------------------
-  # 2. STORAGE LAYER: PostgreSQL (Data Warehouse Target)
+  # 2. STORAGE LAYER: PostgreSQL Target
   # ---------------------------------------------------------------
   postgres-target:
     image: postgres:15-alpine
@@ -76,15 +62,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dwhpassword}
       POSTGRES_DB: ${POSTGRES_DB:-analytics_dwh}
     volumes:
-      # Lưu trữ bền vững cho Data Warehouse.
       - postgres_data:/var/lib/postgresql/data
-      # [MỚI] Mount seed data script vào thư mục init của PostgreSQL
       - ./seed_data/postgres_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      # Mở port 5432 để debug/check data sau khi ETL chạy.
       - "5432:5432"
     healthcheck:
-      # SRE LENS: pg_isready là lệnh chuẩn để check Postgres đã nhận kết nối chưa.
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 10s
@@ -92,70 +74,85 @@ services:
       start_period: 120s
 
   # ---------------------------------------------------------------
-  # 3. CONTROL PLANE & PROCESSING: Dagster Platform
+  # 3. CONTROL PLANE METADATA: PostgreSQL cho Dagster
   # ---------------------------------------------------------------
-  # Đây là "bộ não" của hệ thống.
-  # PRODUCTION GRADE: Chúng ta BUILD image từ Dockerfile, 
-  # COPY code vào trong image. KHÔNG mount volume từ host.
+  dagster-metadata:
+    image: postgres:15-alpine
+    container_name: dataops-dagster-metadata
+    restart: always
+    networks:
+      - dataops-network
+    environment:
+      POSTGRES_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
+      POSTGRES_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
+      POSTGRES_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
+    volumes:
+      - dagster_metadata_data:/var/lib/postgresql/data
+    # Nếu cần debug bằng DBeaver/pgAdmin từ host, tạm uncomment:
+    # ports:
+    #   - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ---------------------------------------------------------------
+  # 4. CONTROL PLANE: Dagster Webserver/UI
+  # ---------------------------------------------------------------
   dagster-platform:
     build:
-      context: .                          # Build context là thư mục gốc project
-      dockerfile: ./platform/dagster/Dockerfile  # Đường dẫn đến Dockerfile
+      context: .
+      dockerfile: ./platform/dagster/Dockerfile
     container_name: dataops-dagster-platform
     restart: always
     networks:
       - dataops-network
     environment:
-      # Truyền thông tin kết nối DB vào container.
-      # Dagster code sẽ đọc các biến môi trường này để connect.
+      # Source DB
       MYSQL_HOST: mysql-source
       MYSQL_PORT: 3306
       MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_db}
       MYSQL_USER: ${MYSQL_USER:-datauser}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-datapassword}
-      
+
+      # Target DB
       POSTGRES_HOST: postgres-target
       POSTGRES_PORT: 5432
       POSTGRES_DATABASE: ${POSTGRES_DB:-analytics_dwh}
       POSTGRES_USER: ${POSTGRES_USER:-datawarehouse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dwhpassword}
-      
-      # Cấu hình Dagster Storage (nơi lưu lịch sử chạy, logs...)
+
+      # Dagster home
       DAGSTER_HOME: /opt/dagster/dagster_home
+
+      # Dagster metadata PostgreSQL
+      DAGSTER_METADATA_HOST: dagster-metadata
+      DAGSTER_METADATA_PORT: 5432
+      DAGSTER_METADATA_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
+      DAGSTER_METADATA_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
+      DAGSTER_METADATA_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
     volumes:
-      # Volume cho Dagster internal storage (logs, run history).
-      # Không liên quan đến source code, chỉ lưu trạng thái vận hành.
+      # Volume cho local state nếu Dagster cần ghi local
       - dagster_storage:/opt/dagster/dagster_home
-      
-      # ============================================================
-      # DEV MODE TOGGLE (Chỉ dùng khi muốn code nhanh)
-      # ============================================================
-      # Nếu bạn muốn sửa code Python và thấy thay đổi ngay lập tức 
-      # mà không cần build lại image, hãy UNCOMMENT 2 dòng dưới đây 
-      # và COMMENT dòng "build:" ở trên lại.
-      # Nhưng hãy nhớ: Đây là cách làm DEV, không phải PRODUCTION.
-      #
-      # - ./user_code:/opt/dagster/user_code
-      # - ./platform:/opt/dagster/platform
+
+      # Bind mount config read-only để tránh volume cũ che file config trong image
+      - ./platform/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
+      - ./platform/dagster/workspace.yaml:/opt/dagster/dagster_home/workspace.yaml:ro
     ports:
-      # Port 3000: Truy cập Dagster UI (Dagit) từ trình duyệt máy host.
-      # Mở trình duyệt và vào http://localhost:3000 để xem pipeline.
       - "3000:3000"
     depends_on:
-      # SRE LENS: Chờ đến khi MySQL và Postgres thực sự HEALTHY 
-      # (pass healthcheck) thì Dagster mới được khởi động.
-      # Nếu chỉ dùng "depends_on: mysql-source" không thôi, 
-      # Dagster sẽ chạy ngay khi container MySQL vừa start, 
-      # lúc đó DB chưa kịp init -> Connection Refused.
+      dagster-metadata:
+        condition: service_healthy
       mysql-source:
         condition: service_healthy
       postgres-target:
         condition: service_healthy
+
   # ---------------------------------------------------------------
-  # 4. CONTROL PLANE: Dagster Daemon (background worker)
+  # 5. CONTROL PLANE: Dagster Daemon
   # ---------------------------------------------------------------
-  # Cùng image với dagster-platform, nhưng chạy command khác.
-  # Cùng image + khác command = immutability, artifact nhất quán.
   dagster-daemon:
     build:
       context: .
@@ -165,29 +162,43 @@ services:
     networks:
       - dataops-network
     environment:
-      # Daemon là nơi thực thi run (DefaultRunLauncher),
-      # nên nó cần cùng env DB và cùng user code như platform.
+      # Source DB
       MYSQL_HOST: mysql-source
       MYSQL_PORT: 3306
       MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_db}
       MYSQL_USER: ${MYSQL_USER:-datauser}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-datapassword}
+
+      # Target DB
       POSTGRES_HOST: postgres-target
       POSTGRES_PORT: 5432
       POSTGRES_DATABASE: ${POSTGRES_DB:-analytics_dwh}
       POSTGRES_USER: ${POSTGRES_USER:-datawarehouse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dwhpassword}
+
+      # Dagster home
       DAGSTER_HOME: /opt/dagster/dagster_home
+
+      # Dagster metadata PostgreSQL
+      DAGSTER_METADATA_HOST: dagster-metadata
+      DAGSTER_METADATA_PORT: 5432
+      DAGSTER_METADATA_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
+      DAGSTER_METADATA_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
+      DAGSTER_METADATA_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
     volumes:
+      # Volume cho local state nếu Dagster cần ghi local
       - dagster_storage:/opt/dagster/dagster_home
+
+      # Bind mount config read-only để tránh volume cũ che file config trong image
+      - ./platform/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
+      - ./platform/dagster/workspace.yaml:/opt/dagster/dagster_home/workspace.yaml:ro
     depends_on:
+      dagster-metadata:
+        condition: service_healthy
       mysql-source:
         condition: service_healthy
       postgres-target:
         condition: service_healthy
-    # HEALTHCHECK trong Dockerfile probe port 3000,
-    # nhưng daemon không chạy webserver -> phải disable,
-    # nếu không container sẽ bị gắn mác "unhealthy" oan.
     healthcheck:
       disable: true
     command: ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]

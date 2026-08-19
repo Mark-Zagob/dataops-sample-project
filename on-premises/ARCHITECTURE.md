@@ -59,7 +59,7 @@ flowchart TB
         subgraph DAEMON["Container 2: dagster-daemon"]
             D1["Daemon loop<br/>Run execution<br/>Schedules<br/>Sensors<br/><i>Role: Nhà máy</i>"]
         end
-        STORE[("SQLite / PostgreSQL<br/>Instance Storage<br/>(runs, events, logs)")]
+        STORE[("PostgreSQL - dagster-metadata<br/>Run History • Event Logs • Schedules")]
         WEB --- STORE
         DAEMON --- STORE
     end
@@ -180,6 +180,47 @@ chỉ khác nhau ở `command`:
 - **Code (Production Mode):** Code Python được **COPY** vào Docker Image qua Dockerfile. Đảm bảo tính bất biến (Immutability).
 - **Code (Dev Mode - Optional):** Có thể dùng **Bind Mount** để tăng tốc độ feedback loop khi phát triển, nhưng phải hiểu rõ rủi ro về version control.
 
+### 6.4. Control Plane Metadata Storage
+
+Dagster metadata được lưu trong một PostgreSQL instance riêng (`dagster-metadata`), không sử dụng SQLite.
+
+Các thành phần được lưu trong metadata database bao gồm:
+
+- Run history
+- Event logs
+- Schedule storage
+- Daemon heartbeat / leader election state
+
+Lý do lựa chọn PostgreSQL:
+
+- Hỗ trợ concurrent access tốt hơn SQLite.
+- Phù hợp hơn khi có nhiều người dùng Dagster UI đồng thời.
+- Dễ backup/restore và kiểm tra integrity.
+- Dễ quan sát trạng thái vận hành của Control Plane.
+- Hỗ trợ tốt hơn cho các kịch bản upgrade, migration và mở rộng sau này.
+
+Thiết kế này cũng tách biệt rõ ràng giữa:
+
+- Control Plane state: metadata của Dagster.
+- Data Plane storage: dữ liệu trong `postgres-target`.
+
+Failure mode:
+
+Nếu `dagster-metadata` không khả dụng:
+
+- Dagster UI có thể không hoạt động.
+- Run mới có thể không được dequeue hoặc thực thi.
+- Schedules/sensors có thể không hoạt động.
+- Việc quan sát lịch sử run có thể bị gián đoạn.
+
+Tuy nhiên, dữ liệu đã được materialize thành công vào `orders_production` vẫn không tự động mất. Đây là Control Plane outage, không phải Data Plane data corruption.
+
+SLO gợi ý cho metadata database:
+
+- Availability: 99.5%
+- Connection success rate: > 99.9%
+- Disk usage alert: > 70–80%
+- Daemon heartbeat freshness: không trễ quá 2 phút
 ---
 
 ## 7. Operational Readiness (Sẵn sàng vận hành)

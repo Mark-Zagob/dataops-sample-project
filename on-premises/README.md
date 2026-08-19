@@ -73,6 +73,22 @@ Dự án này mô phỏng một **Data Platform Production-grade** chạy trên 
 2. **Extract & Load:** Đọc dữ liệu từ MySQL → Ghi vào bảng `orders_staging` trong PostgreSQL.
 3. **Atomic Swap:** Đổi tên `orders_staging` → `orders_production` trong một transaction. Nếu lỗi, ROLLBACK, dữ liệu cũ vẫn an toàn.
 
+### Control Plane Metadata Storage
+
+Lab này sử dụng PostgreSQL riêng (`dagster-metadata`) để lưu trữ trạng thái vận hành của Dagster, bao gồm:
+
+- Run history
+- Event logs
+- Schedule storage
+
+Lý do:
+
+- Hỗ trợ concurrent access tốt hơn SQLite.
+- Dễ backup/restore hơn.
+- Phù hợp hơn cho multi-user và vận hành production.
+- Tách biệt Control Plane metadata khỏi Data Plane storage.
+
+Nếu `dagster-metadata` gặp sự cố, Dagster UI và khả năng thực thi run mới có thể bị ảnh hưởng. Tuy nhiên, dữ liệu đã tồn tại trong `orders_production` không tự động bị mất. Đây là Control Plane outage, không phải Data Plane data corruption.
 ---
 
 ## ✅ Yêu cầu tiên quyết
@@ -512,6 +528,27 @@ Nếu thiếu Daemon, mọi run sẽ nằm trong queue vĩnh viễn.
 ```
 
 > ⚠️ **Không khuyến nghị** đổi MySQL user sang `mysql_native_password`. Plugin này đã deprecated từ MySQL 8.0 và bị gỡ ở MySQL 8.4. Sửa đúng là bổ sung dependency phía client.
+---
+### Lỗi: Dagster vẫn dùng SQLite sau khi đã chuyển sang PostgreSQL
+
+Nguyên nhân:
+
+- Volume `dagster_storage` cũ vẫn còn chứa `dagster.yaml` SQLite.
+- Container chưa được build/recreate sau khi đổi config.
+- Biến môi trường Dagster metadata chưa được truyền đủ vào cả `dagster-platform` và `dagster-daemon`.
+
+Giải pháp:
+
+1. Đảm bảo `platform/dagster/dagster.yaml` đang dùng PostgreSQL storage.
+2. Đảm bảo `docker-compose.yml` có service `dagster-metadata`.
+3. Đảm bảo cả `dagster-platform` và `dagster-daemon` có các biến:
+   - `DAGSTER_METADATA_HOST`
+   - `DAGSTER_METADATA_USER`
+   - `DAGSTER_METADATA_PASSWORD`
+   - `DAGSTER_METADATA_DB`
+4. Xóa volume `dagster_storage` nếu nghi ngờ config cũ còn tồn tại.
+5. Build và recreate lại toàn bộ lab.
+
 ---
 
 ## ❓ FAQ
