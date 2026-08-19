@@ -6,15 +6,11 @@
 # - Event log storage: PostgreSQL
 # - Schedule storage: PostgreSQL
 #
-# Mục tiêu:
-# - Hỗ trợ concurrent access tốt hơn SQLite
-# - Dễ backup/restore metadata DB
-# - Phù hợp cho multi-user và vận hành production hơn
-# - Control Plane state được đặt trong một database riêng
+# Compatible với dagster-postgres==0.26.2
 # =================================================================
 
 run_storage:
-  module: dagster_postgres.storage.runs
+  module: dagster_postgres.storage
   class: PostgresRunStorage
   config:
     postgres_db:
@@ -24,12 +20,12 @@ run_storage:
         env: DAGSTER_METADATA_USER
       password:
         env: DAGSTER_METADATA_PASSWORD
-      database:
+      db_name:
         env: DAGSTER_METADATA_DB
       port: 5432
 
 event_log_storage:
-  module: dagster_postgres.storage.event_log
+  module: dagster_postgres.storage
   class: PostgresEventLogStorage
   config:
     postgres_db:
@@ -39,12 +35,12 @@ event_log_storage:
         env: DAGSTER_METADATA_USER
       password:
         env: DAGSTER_METADATA_PASSWORD
-      database:
+      db_name:
         env: DAGSTER_METADATA_DB
       port: 5432
 
 schedule_storage:
-  module: dagster_postgres.storage.schedules
+  module: dagster_postgres.storage
   class: PostgresScheduleStorage
   config:
     postgres_db:
@@ -54,7 +50,7 @@ schedule_storage:
         env: DAGSTER_METADATA_USER
       password:
         env: DAGSTER_METADATA_PASSWORD
-      database:
+      db_name:
         env: DAGSTER_METADATA_DB
       port: 5432
 
