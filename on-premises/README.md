@@ -86,9 +86,8 @@ Lý do:
 - Hỗ trợ concurrent access tốt hơn SQLite.
 - Dễ backup/restore hơn.
 - Phù hợp hơn cho multi-user và vận hành production.
-- Tách biệt Control Plane metadata khỏi Data Plane storage.
-
-Nếu `dagster-metadata` gặp sự cố, Dagster UI và khả năng thực thi run mới có thể bị ảnh hưởng. Tuy nhiên, dữ liệu đã tồn tại trong `orders_production` không tự động bị mất. Đây là Control Plane outage, không phải Data Plane data corruption.
+- Tách biệt Control Plane metadata khỏi Data Plane storage.  
+>Nếu `dagster-metadata` gặp sự cố, Dagster UI và khả năng thực thi run mới có thể bị ảnh hưởng. Tuy nhiên, dữ liệu đã tồn tại trong `orders_production` không tự động bị mất. Đây là Control Plane outage, không phải Data Plane data corruption.
 ---
 
 ## ✅ Yêu cầu tiên quyết
