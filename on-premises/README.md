@@ -701,6 +701,7 @@ A: Nếu run cũ `failed` và chưa có run mới thay thế, bạn có thể re
 **Q: Vì sao source trả về 0 rows làm pipeline fail?**
 
 A: Hiện tại lab cấu hình `MIN_EXPECTED_ROWS = 1` để fail-fast khi source bất thường. Nếu nghiệp vụ cho phép source rỗng, hãy đổi `MIN_EXPECTED_ROWS = 0` trong `user_code/contracts/order_contract.py`.
+
 ---
 
 ## 🤝 Liên hệ & Hỗ trợ
