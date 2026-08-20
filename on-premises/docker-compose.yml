@@ -1,12 +1,12 @@
 # =================================================================
-# NETWORKS: Tạo mạng nội bộ riêng biệt
+# NETWORKS
 # =================================================================
 networks:
   dataops-network:
     driver: bridge
 
 # =================================================================
-# VOLUMES: Lưu trữ bền vững cho Databases và Dagster state
+# VOLUMES
 # =================================================================
 volumes:
   mysql_data:
@@ -22,9 +22,10 @@ volumes:
 # SERVICES
 # =================================================================
 services:
-  # ---------------------------------------------------------------
+
+  # ----------------------------------------------------------------
   # 1. SOURCE LAYER: MySQL
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   mysql-source:
     image: mysql:8.0
     container_name: dataops-mysql-source
@@ -42,15 +43,19 @@ services:
     ports:
       - "3306:3306"
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      test:
+        [
+          "CMD-SHELL",
+          "MYSQL_PWD=$$MYSQL_PASSWORD mysql --host=localhost --port=3306 --user=$$MYSQL_USER --database=$$MYSQL_DATABASE --connect-timeout=5 --batch --skip-column-names --execute='SELECT 1'"
+        ]
       interval: 10s
       timeout: 10s
       retries: 12
       start_period: 600s
 
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   # 2. STORAGE LAYER: PostgreSQL Target
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   postgres-target:
     image: postgres:15-alpine
     container_name: dataops-postgres-target
@@ -67,40 +72,55 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test:
+        [
+          "CMD-SHELL",
+          "PGPASSWORD=$$POSTGRES_PASSWORD psql -v ON_ERROR_STOP=1 --host=localhost --port=5432 --username=$$POSTGRES_USER --dbname=$$POSTGRES_DB --no-align --tuples-only --command='SELECT 1'"
+        ]
       interval: 10s
       timeout: 10s
       retries: 10
       start_period: 120s
 
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   # 3. CONTROL PLANE METADATA: PostgreSQL cho Dagster
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   dagster-metadata:
     image: postgres:15-alpine
     container_name: dataops-dagster-metadata
     restart: always
     networks:
       - dataops-network
+
     environment:
+      # PostgreSQL image cần các biến POSTGRES_*
       POSTGRES_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
       POSTGRES_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
       POSTGRES_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
+
+      # Healthcheck đang dùng các biến DAGSTER_METADATA_*,
+      # nên phải inject chúng vào container này.
+      DAGSTER_METADATA_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
+      DAGSTER_METADATA_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
+      DAGSTER_METADATA_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
+
     volumes:
       - dagster_metadata_data:/var/lib/postgresql/data
-    # Nếu cần debug bằng DBeaver/pgAdmin từ host, tạm uncomment:
-    # ports:
-    #   - "5433:5432"
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test:
+        [
+          "CMD-SHELL",
+          "PGPASSWORD=$$DAGSTER_METADATA_PASSWORD psql -v ON_ERROR_STOP=1 --host=localhost --port=5432 --username=$$DAGSTER_METADATA_USER --dbname=$$DAGSTER_METADATA_DB --no-align --tuples-only --command='SELECT 1'"
+        ]
       interval: 10s
       timeout: 10s
       retries: 10
       start_period: 60s
 
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   # 4. CONTROL PLANE: Dagster Webserver/UI
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   dagster-platform:
     build:
       context: .
@@ -109,17 +129,24 @@ services:
     restart: always
     networks:
       - dataops-network
+    command:
+      [
+        "dagster-webserver",
+        "-h", "0.0.0.0",
+        "-p", "3000",
+        "-w", "/opt/dagster/dagster_home/workspace.yaml"
+      ]
     environment:
       # Source DB
       MYSQL_HOST: mysql-source
-      MYSQL_PORT: 3306
+      MYSQL_PORT: "3306"
       MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_db}
       MYSQL_USER: ${MYSQL_USER:-datauser}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-datapassword}
 
       # Target DB
       POSTGRES_HOST: postgres-target
-      POSTGRES_PORT: 5432
+      POSTGRES_PORT: "5432"
       POSTGRES_DATABASE: ${POSTGRES_DB:-analytics_dwh}
       POSTGRES_USER: ${POSTGRES_USER:-datawarehouse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dwhpassword}
@@ -129,15 +156,21 @@ services:
 
       # Dagster metadata PostgreSQL
       DAGSTER_METADATA_HOST: dagster-metadata
-      DAGSTER_METADATA_PORT: 5432
+      DAGSTER_METADATA_PORT: "5432"
       DAGSTER_METADATA_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
       DAGSTER_METADATA_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
       DAGSTER_METADATA_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
-    volumes:
-      # Volume cho local state nếu Dagster cần ghi local
-      - dagster_storage:/opt/dagster/dagster_home
 
-      # Bind mount config read-only để tránh volume cũ che file config trong image
+      # Healthcheck settings
+      HEALTHCHECK_HTTP_TIMEOUT_SECONDS: ${HEALTHCHECK_HTTP_TIMEOUT_SECONDS:-5}
+      HEALTHCHECK_DB_TIMEOUT_SECONDS: ${HEALTHCHECK_DB_TIMEOUT_SECONDS:-5}
+
+      # Optional data plane healthcheck settings
+      DATA_HEALTH_MIN_EXPECTED_ROWS: ${DATA_HEALTH_MIN_EXPECTED_ROWS:-1}
+      DATA_HEALTH_MAX_AGE_HOURS: ${DATA_HEALTH_MAX_AGE_HOURS:-26}
+
+    volumes:
+      - dagster_storage:/opt/dagster/dagster_home
       - ./platform/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
       - ./platform/dagster/workspace.yaml:/opt/dagster/dagster_home/workspace.yaml:ro
     ports:
@@ -149,10 +182,20 @@ services:
         condition: service_healthy
       postgres-target:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python /opt/dagster/healthchecks/webserver_healthcheck.py"
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
 
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   # 5. CONTROL PLANE: Dagster Daemon
-  # ---------------------------------------------------------------
+  # ----------------------------------------------------------------
   dagster-daemon:
     build:
       context: .
@@ -161,17 +204,23 @@ services:
     restart: always
     networks:
       - dataops-network
+    command:
+      [
+        "dagster-daemon",
+        "run",
+        "-w", "/opt/dagster/dagster_home/workspace.yaml"
+      ]
     environment:
       # Source DB
       MYSQL_HOST: mysql-source
-      MYSQL_PORT: 3306
+      MYSQL_PORT: "3306"
       MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_db}
       MYSQL_USER: ${MYSQL_USER:-datauser}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-datapassword}
 
       # Target DB
       POSTGRES_HOST: postgres-target
-      POSTGRES_PORT: 5432
+      POSTGRES_PORT: "5432"
       POSTGRES_DATABASE: ${POSTGRES_DB:-analytics_dwh}
       POSTGRES_USER: ${POSTGRES_USER:-datawarehouse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dwhpassword}
@@ -181,15 +230,21 @@ services:
 
       # Dagster metadata PostgreSQL
       DAGSTER_METADATA_HOST: dagster-metadata
-      DAGSTER_METADATA_PORT: 5432
+      DAGSTER_METADATA_PORT: "5432"
       DAGSTER_METADATA_USER: ${DAGSTER_METADATA_USER:-dagster_metadata}
       DAGSTER_METADATA_PASSWORD: ${DAGSTER_METADATA_PASSWORD:-metadata_password_change_me}
       DAGSTER_METADATA_DB: ${DAGSTER_METADATA_DB:-dagster_metadata}
-    volumes:
-      # Volume cho local state nếu Dagster cần ghi local
-      - dagster_storage:/opt/dagster/dagster_home
 
-      # Bind mount config read-only để tránh volume cũ che file config trong image
+      # Healthcheck settings
+      HEALTHCHECK_DB_TIMEOUT_SECONDS: ${HEALTHCHECK_DB_TIMEOUT_SECONDS:-5}
+      DAGSTER_DAEMON_HEARTBEAT_MAX_STALE_SECONDS: ${DAGSTER_DAEMON_HEARTBEAT_MAX_STALE_SECONDS:-120}
+
+      # Optional data plane healthcheck settings
+      DATA_HEALTH_MIN_EXPECTED_ROWS: ${DATA_HEALTH_MIN_EXPECTED_ROWS:-1}
+      DATA_HEALTH_MAX_AGE_HOURS: ${DATA_HEALTH_MAX_AGE_HOURS:-26}
+
+    volumes:
+      - dagster_storage:/opt/dagster/dagster_home
       - ./platform/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
       - ./platform/dagster/workspace.yaml:/opt/dagster/dagster_home/workspace.yaml:ro
     depends_on:
@@ -200,5 +255,12 @@ services:
       postgres-target:
         condition: service_healthy
     healthcheck:
-      disable: true
-    command: ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+      test:
+        [
+          "CMD-SHELL",
+          "python /opt/dagster/healthchecks/daemon_healthcheck.py"
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s

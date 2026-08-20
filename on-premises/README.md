@@ -132,9 +132,11 @@ cp .env.example .env
 
 > 📝 Nội dung file `.env` mặc định đã sẵn sàng để chạy Lab. Bạn không cần sửa gì thêm trừ khi muốn thay đổi credentials.
 
-Nếu bạn cần tạo thủ công, nội dung file `.env` như sau:
+File `.env` chứa credentials và KHÔNG được commit lên Git.
 
-```bash
+Nội dung tối thiểu:
+
+```dotenv
 # MySQL Source Credentials
 MYSQL_ROOT_PASSWORD=rootpassword
 MYSQL_DATABASE=sales_db
@@ -145,6 +147,20 @@ MYSQL_PASSWORD=datapassword
 POSTGRES_USER=datawarehouse
 POSTGRES_PASSWORD=dwhpassword
 POSTGRES_DB=analytics_dwh
+
+# Dagster Metadata PostgreSQL Credentials
+DAGSTER_METADATA_USER=dagster_metadata
+DAGSTER_METADATA_PASSWORD=metadata_password_change_me
+DAGSTER_METADATA_DB=dagster_metadata
+
+# Healthcheck behavior
+HEALTHCHECK_HTTP_TIMEOUT_SECONDS=5
+HEALTHCHECK_DB_TIMEOUT_SECONDS=5
+DAGSTER_DAEMON_HEARTBEAT_MAX_STALE_SECONDS=120
+
+# Optional data plane healthcheck thresholds
+DATA_HEALTH_MIN_EXPECTED_ROWS=1
+DATA_HEALTH_MAX_AGE_HOURS=26
 ```
 
 ### Bước 3: Khởi động hệ thống
@@ -167,13 +183,14 @@ docker compose ps
 
 | NAME | STATUS | Vai trò |
 |---|---|---|
-| `dataops-mysql-source` | Up (healthy) | Source DB |
-| `dataops-postgres-target` | Up (healthy) | Target DB |
-| `dataops-dagster-platform` | Up (healthy) | Dagster Webserver (UI) |
-| `dataops-dagster-daemon` | Up | Dagster Daemon (thực thi runs) |
+| dataops-mysql-source | Up (healthy) | Source DB |
+| dataops-postgres-target | Up (healthy) | Target DB |
+| dataops-dagster-metadata | Up (healthy) | Dagster Metadata DB |
+| dataops-dagster-platform | Up (healthy) | Dagster Webserver / UI |
+| dataops-dagster-daemon | Up (healthy) | Dagster Daemon / Run Execution |
 
-> 💡 Service `dagster-daemon` không có healthcheck HTTP vì nó không chạy webserver. Docker chỉ báo `Up` (không có `(healthy)`), điều này là bình thường.
-
+>💡 Service `dagster-daemon` không có healthcheck HTTP vì nó không chạy webserver. Docker chỉ báo `Up` (không có `(healthy)`), điều này là bình thường.  
+> Ban đầu, một số service có thể mất thời gian để trở thành healthy do healthcheck có `start_period`. Nếu `dagster-daemon` chưa healthy ngay, hãy chờ hết `start_period` và kiểm tra log nếu nó vẫn unhealthy.
 ### Bước 5: Truy cập Dagster UI
 
 Mở trình duyệt và vào:
@@ -213,6 +230,24 @@ Bạn sẽ thấy giao diện Dagster với 3 Assets trong group `orders_pipelin
 ```
 
 ---
+## Healthcheck trong lab
+
+Lab này sử dụng healthcheck nâng cao hơn mức kiểm tra container còn sống.
+
+| Service | Healthcheck | Ý nghĩa |
+|---|---|---|
+| mysql-source | Authenticated `SELECT 1` | MySQL sống, user và database dùng được |
+| postgres-target | Authenticated `SELECT 1` | PostgreSQL sống, user và database dùng được |
+| dagster-metadata | Authenticated `SELECT 1` | Metadata DB sống, user Dagster dùng được |
+| dagster-platform | HTTP `/health` + metadata DB check | Webserver sẵn sàng và metadata DB truy cập được |
+| dagster-daemon | Daemon heartbeat freshness | Daemon còn sống và đang gửi heartbeat |
+
+> Lưu ý:
+
+- Container healthy không có nghĩa là dữ liệu chắc chắn mới.
+- Container healthy không có nghĩa là SLO freshness đã đạt.
+- Docker Compose healthcheck không tự động restart container nếu container bị unhealthy.
+---
 
 ## 📁 Cấu trúc thư mục
 
@@ -236,7 +271,10 @@ dataops-lab/
 │       ├── requirements.txt        # Python dependencies
 │       ├── dagster.yaml            # Cấu hình Dagster Instance
 │       └── workspace.yaml          # Khai báo User Code location
-│
+│       └── healthchecks/
+│           ├── webserver_healthcheck.py
+│           ├── daemon_healthcheck.py
+│           └── data_plane_healthcheck.py
 └── user_code/                      # [DATA TEAM] Logic nghiệp vụ dữ liệu
     ├── __init__.py
     ├── definitions.py              # Entry point: Tổng hợp tất cả Assets
@@ -636,6 +674,28 @@ Bảng này:
 
 Nếu bạn cần rollback khẩn cấp, tham khảo phần Disaster Recovery trong `ARCHITECTURE.md`.
 
+### Lỗi: `dagster-metadata` unhealthy
+
+Triệu chứng:
+
+- Container `dataops-dagster-metadata` bị unhealthy.
+- Các service phụ thuộc như `dagster-platform` và `dagster-daemon` không start được.
+- Xuất hiện lỗi `dependency failed to start`.
+
+Nguyên nhân thường gặp:
+
+1. Healthcheck đang dùng biến môi trường không tồn tại bên trong container.
+2. Volume `dagster_metadata_data` đã được khởi tạo từ trước với credentials khác.
+3. PostgreSQL metadata chưa sẵn sàng trong giai đoạn khởi động.
+4. User hoặc database được khai báo trong `.env` không khớp với volume hiện tại.
+
+Cách xử lý:
+
+- Kiểm tra log của `dagster-metadata` để biết lỗi thật.
+- Đảm bảo service `dagster-metadata` có các biến môi trường cần thiết cho healthcheck.
+- Nếu log cho thấy lỗi authentication, role không tồn tại hoặc database không tồn tại, khả năng cao volume cũ không khớp với credentials hiện tại.
+- Trong lab, có thể reset volume để khởi tạo lại từ đầu. Trong môi trường có dữ liệu quan trọng, phải backup trước khi reset.
+
 ---
 
 ## ❓ FAQ
@@ -701,6 +761,27 @@ A: Nếu run cũ `failed` và chưa có run mới thay thế, bạn có thể re
 **Q: Vì sao source trả về 0 rows làm pipeline fail?**
 
 A: Hiện tại lab cấu hình `MIN_EXPECTED_ROWS = 1` để fail-fast khi source bất thường. Nếu nghiệp vụ cho phép source rỗng, hãy đổi `MIN_EXPECTED_ROWS = 0` trong `user_code/contracts/order_contract.py`.
+
+
+**Q: Vì sao `dagster-daemon` bây giờ có trạng thái healthy?**
+
+Vì daemon đã có healthcheck dựa trên heartbeat trong metadata database. Healthcheck này không dùng HTTP, mà kiểm tra xem daemon còn gửi heartbeat mới hay không.
+
+**Q: Vì sao healthcheck database không dùng `ping` hoặc `pg_isready` nữa?**
+
+Vì các lệnh đó chỉ kiểm tra process/database có đang sống. Chúng không kiểm tra được user, password, database và quyền query tối thiểu. Healthcheck mới dùng authenticated query để gần với hành vi thật của ứng dụng hơn.
+
+**Q: Container unhealthy có tự động restart không?**
+
+Trong Docker Compose, healthcheck chủ yếu dùng để theo dõi trạng thái và hỗ trợ startup dependency. Nó không tự động restart container chỉ vì container bị unhealthy. Nếu cần tự phục hồi mạnh hơn, cần watchdog bên ngoài hoặc Kubernetes probes.
+
+**Q: Vì sao `.env` có biến nhưng container vẫn không thấy biến đó?**
+
+Vì `.env` chỉ cung cấp giá trị cho Docker Compose interpolation. Biến chỉ xuất hiện bên trong container nếu được khai báo trong phần `environment` của service tương ứng.
+
+**Q: Khi nào cần reset volumes?**
+
+Khi volume cũ được khởi tạo với credentials khác, hoặc khi bạn muốn đưa lab về trạng thái seed data ban đầu. Reset volumes sẽ xóa dữ liệu hiện tại, chỉ nên dùng trong lab hoặc khi đã backup.
 
 ---
 

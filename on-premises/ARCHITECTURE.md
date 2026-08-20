@@ -1,6 +1,6 @@
 # 🏛️ Data Platform Architecture - Production-Grade Lab
 
-**Version:** 1.1  
+**Version:** 1.2   
 **Status:** Approved  
 **Owner:** Platform Engineering Team  
 
@@ -10,6 +10,7 @@
 |---|---|---|
 | 1.0 | Initial version | Architecture gốc với Atomic Swap, Data Contract, Control Plane / Data Plane separation |
 | 1.1 | Current | Bổ sung concurrency control, run-scoped staging, orphan cleanup, advisory lock, backup retention |
+| 1.2 | Current | Bổ sung healthcheck strategy: functional DB healthcheck, webserver readiness, daemon heartbeat healthcheck, metadata DB healthcheck và phân biệt container/service/data product health |
 
 ---
 
@@ -131,12 +132,13 @@ Data Pipeline không chỉ cần đúng về mặt dữ liệu, mà còn cần a
 
 **SLI gợi ý:**
 
-| SLI | Ngưỡng cảnh báo |
-|---|---|
-| Time a run spends in QUEUED state | > 5 phút |
-| Number of concurrently running runs | > 1 |
-| Orphan staging tables after successful run | > 0 |
-| Number of production backup tables | > 1 |
+| SLI | Ý nghĩa | Ngưỡng cảnh báo |
+|---|---|---|
+| Metadata DB authenticated health | Metadata DB có login và query được không | Fail liên tục > 1 phút |
+| Webserver readiness | UI/API có sẵn sàng không | HTTP fail hoặc metadata DB fail |
+| Daemon heartbeat freshness | Daemon còn đang dequeue/execute run không | Stale > 120 giây |
+| Active daemon count | Phát hiện split-brain | > 1 daemon active gần nhau |
+| Data plane health | Production data có pass quality/freshness không | Fail sau pipeline run |
 ---
 
 ## 4. System Architecture (Kiến trúc hệ thống)
@@ -294,13 +296,64 @@ Nếu retry một run cũ sau khi đã có run mới chạy thành công:
 ### 6.1. Service Decomposition
 
 | Service Name | Role | Port | Healthcheck | Dependency |
-|--------------|------|------|--------------|------------|
-| `mysql-source` | Source DB | 3306 | `mysqladmin ping` | None |
-| `postgres-target` | Target DB | 5432 | `pg_isready` | None |
-| `dagster-platform` | Dagster Webserver (UI + API) | 3000 | HTTP check `/health` | `mysql-source` (healthy), `postgres-target` (healthy) |
-| `dagster-daemon` | Dagster Daemon (Run Execution) | — | Disabled* | `mysql-source` (healthy), `postgres-target` (healthy) |
+|---|---|---|---|---|
+| `mysql-source` | Source DB | 3306 | Authenticated MySQL query `SELECT 1` bằng application user | None |
+| `postgres-target` | Target DB | 5432 | Authenticated PostgreSQL query `SELECT 1` bằng application user | None |
+| `dagster-metadata` | Control Plane Metadata DB | Không expose | Authenticated PostgreSQL query `SELECT 1` bằng metadata user | None |
+| `dagster-platform` | Dagster Webserver / UI | 3000 | HTTP `/health` + metadata DB connectivity check | `dagster-metadata`, `mysql-source`, `postgres-target` healthy |
+| `dagster-daemon` | Dagster Daemon / Run Execution | Không expose | Daemon heartbeat freshness check + split-brain detection | `dagster-metadata`, `mysql-source`, `postgres-target` healthy |
 
-\* Daemon không expose HTTP endpoint, nên không có healthcheck HTTP. Thay vào đó, Dagster tự theo dõi heartbeat của daemon và cảnh báo trên UI tab **Deployment** nếu daemon ngừng heartbeat.
+> \* `dagster-daemon` không expose HTTP endpoint, vì vậy không dùng HTTP healthcheck.
+
+Trong phiên bản hiện tại, daemon được kiểm tra bằng healthcheck script dựa trên heartbeat trong Dagster metadata database. Healthcheck này kiểm tra:
+
+- Metadata database có kết nối được không.
+- Bảng daemon heartbeat có tồn tại không.
+- `RUN_COORDINATOR` heartbeat còn mới không.
+- Có dấu hiệu nhiều daemon active cùng lúc hay không.
+
+Dagster UI vẫn có thể hiển thị trạng thái daemon, nhưng Docker healthcheck giúp phát hiện sớm ở tầng hạ tầng.
+
+### Healthcheck Strategy
+
+Healthcheck trong lab này được thiết kế theo nguyên tắc:
+
+> Healthy container không đồng nghĩa với healthy service.  
+> Healthy service không đồng nghĩa với healthy data product.
+
+Các lớp healthcheck được phân biệt như sau:
+
+| Lớp | Ý nghĩa | Ví dụ |
+|---|---|---|
+| Liveness | Process/container còn sống không | Docker container state |
+| Readiness | Service đã sẵn sàng phục vụ chưa | Dagster webserver HTTP check |
+| Dependency health | Phụ thuộc có thật sự dùng được không | Database authenticated `SELECT 1` |
+| Functional health | Chức năng tối thiểu có hoạt động không | Metadata DB connectivity từ webserver |
+| Control plane health | Dagster control plane có khỏe không | Daemon heartbeat freshness |
+| Data plane health | Dữ liệu production có đáng tin không | Data quality, freshness, orphan staging |
+
+Design decision quan trọng:
+
+- Database healthcheck không chỉ kiểm tra process alive.
+- MySQL và PostgreSQL healthcheck phải kiểm tra được user, database và quyền query tối thiểu.
+- Dagster webserver healthcheck không phụ thuộc trực tiếp vào daemon healthcheck.
+- Dagster daemon healthcheck dựa trên heartbeat vì daemon không expose HTTP endpoint.
+- Data plane health không được gắn trực tiếp vào container healthcheck của database vì trạng thái dữ liệu phụ thuộc vào pipeline lifecycle.
+
+> Docker Compose healthcheck chỉ thể hiện trạng thái `healthy`/`unhealthy`. Nó **không tự động restart** container khi container bị unhealthy.
+
+Vì vậy, healthcheck trong Docker Compose phù hợp cho:
+
+- Startup dependency.
+- Phát hiện sớm lỗi service.
+- Hỗ trợ troubleshooting.
+- Làm nền tảng để migrate sang K8s probes.
+
+Để tự phục hồi hoàn toàn trong production, cần cân nhắc:
+
+- Kubernetes liveness/readiness probes.
+- External watchdog.
+- Monitoring/alerting.
 
 #### Immutability Pattern: "Same Image, Different Command"
 
