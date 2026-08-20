@@ -30,12 +30,14 @@
 Dự án này mô phỏng một **Data Platform Production-grade** chạy trên môi trường On-prem sử dụng Docker Compose. Nó thể hiện các nguyên lý cốt lõi của DataOps:
 
 | Nguyên lý | Hiện thực hóa trong Lab |
-|-----------|--------------------------|
-| **Idempotency** | Atomic Swap (Pattern C) - Zero-downtime data deployment |
-| **Data Contracts** | Fail-fast Schema Validation trước khi ETL chạy |
-| **Observability** | Dagster UI với Lineage, Logs, Metadata |
-| **Self-serve** | Seed data tự động, không cần nhờ Platform Team |
-| **Blast Radius Control** | Tách biệt Services, Healthchecks, Dependency Management |
+|---|---|
+| Idempotency | Atomic Swap + run-scoped staging |
+| Data Contracts | Fail-fast Schema Validation trước khi ETL chạy |
+| Concurrency Control | QueuedRunCoordinator, max_concurrent_runs=1 |
+| Observability | Dagster UI với Lineage, Logs, Metadata |
+| Self-serve | Seed data tự động, không cần nhờ Platform Team |
+| Blast Radius Control | Tách biệt Services, Healthchecks, Dependency Management |
+| Recoverability | Backup một thế hệ và orphan cleanup |
 
 > 📐 **Muốn hiểu sâu hơn?** Hãy đọc [ARCHITECTURE.md](./ARCHITECTURE.md) để biết chi tiết về các quyết định thiết kế và trade-offs.
 
@@ -59,11 +61,12 @@ Dự án này mô phỏng một **Data Platform Production-grade** chạy trên 
                               │
                ┌──────────────┴──────────────┐
                │                              │
-┌──────────────▼──────────┐    ┌──────────────▼──────────┐
-│  MySQL Source (3306)     │    │  PostgreSQL Target      │
-│  sales_db.orders         │    │  analytics_dwh          │
-│  (10 rows seed data)     │    │  orders_staging         │
-│                          │    │  orders_production      │
+┌──────────────▼──────────┐    ┌──────────────▼────────────┐
+│  MySQL Source (3306)     │    │  PostgreSQL Target       │
+│  sales_db.orders         │    │  analytics_dwh           │
+│  (10 rows seed data)     │    │  orders_stg_<run_id>     │
+│                          │    │  orders_production       |
+│                          |    |  orders_production_backup|  
 └──────────────────────────┘    └──────────────────────────┘
 ```
 
@@ -183,6 +186,14 @@ Bạn sẽ thấy giao diện Dagster với 3 Assets trong group `orders_pipelin
 
 ### Bước 6: Chạy Pipeline đầu tiên
 
+> 💡 **Lưu ý về concurrency:**
+> Hệ thống hiện tại đang cấu hình **single-flight execution**. Nếu bạn hoặc người khác trigger nhiều run cùng lúc:
+> - Run đầu tiên sẽ chạy.
+> - Các run tiếp theo có thể ở trạng thái `Queued`.
+> - Đây là hành vi bình thường, không phải lỗi.
+> - Daemon sẽ dequeue run kế tiếp sau khi run hiện tại kết thúc.
+>
+> Nếu một run nằm ở trạng thái `Queued` quá lâu, hãy kiểm tra service `dagster-daemon`.
 1. Trong Dagster UI, vào tab **Assets** ở sidebar trái.
 2. Chọn view **Asset Graph** (biểu tượng đồ thị, không phải view List).
 3. Bạn sẽ thấy 3 asset được nối với nhau:
@@ -192,9 +203,7 @@ Bạn sẽ thấy giao diện Dagster với 3 Assets trong group `orders_pipelin
    > 💡 **Vì sao phải dùng "Materialize all"?**
    > Nếu bạn click riêng vào `orders_production` và bấm `Materialize`, Dagster chỉ chạy asset đó và cảnh báo "upstream has not been materialized". Atomic Swap sẽ fail vì bảng staging chưa tồn tại.
    > **"Materialize all" đảm bảo cả chuỗi chạy đúng thứ tự dependency.**
-
 5. Quan sát Run mới xuất hiện ở tab **Runs**. Click vào Run để xem 3 step lần lượt chuyển sang trạng thái **Succeeded**.
-
 ✅ **Thành công khi bạn thấy:**
 
 ```text
@@ -255,9 +264,16 @@ dataops-lab/
 **Cách 1: Qua Dagster UI (Khuyến nghị)**
 
 1. Vào `http://localhost:3000`
-2. Tab **Assets** → Chọn asset cần chạy
-3. Bấm **"Materialize"**
-4. Quan sát logs và lineage trong UI
+2. Tab **Assets** → chọn group `orders_pipeline`
+3. Bấm **Materialize all**
+
+Hoặc chạy qua Job:
+
+1. Vào tab **Jobs**
+2. Chọn `orders_pipeline_job`
+3. Bấm **Launch Run**
+
+Khuyến nghị dùng **Materialize all** hoặc **Job** để đảm bảo toàn bộ pipeline chạy đúng thứ tự dependency.
 
 **Cách 2: Qua CLI (Dành cho automation/testing)**
 
@@ -388,14 +404,27 @@ docker exec -it dataops-postgres-target psql -U datawarehouse -d analytics_dwh
 **Kiểm tra dữ liệu sau khi chạy pipeline:**
 
 ```sql
--- Trong PostgreSQL
 -- Xem các bảng hiện có
 \dt
 
+-- Kỳ vọng:
+-- orders_production
+-- orders_production_backup (có thể có nếu đã có production trước đó)
+
 -- Kiểm tra dữ liệu trong bảng production
 SELECT COUNT(*) FROM orders_production;
-SELECT * FROM orders_production ORDER BY created_at DESC LIMIT 10;
+
+SELECT *
+FROM orders_production
+ORDER BY created_at DESC
+LIMIT 10;
 ```
+
+Sau một run thành công:
+
+- Không nên còn bảng `orders_stg_*`.
+- Có thể còn bảng `orders_production_backup`.
+- `orders_production_backup` là dữ liệu của thế hệ production trước.
 
 ---
 
@@ -476,33 +505,57 @@ docker compose up --build -d
 ```
 
 2. Kiểm tra logs của asset `orders_production` trong Dagster UI.
-3. Kiểm tra PostgreSQL có bảng `orders_staging` còn tồn tại không (nếu còn, nghĩa là Swap chưa hoàn thành):
+3. Kiểm tra PostgreSQL có bảng staging orphan hoặc legacy staging không:
 
 ```bash
-   docker exec -it dataops-postgres-target psql -U datawarehouse -d analytics_dwh -c "\dt"
+   docker exec -it dataops-postgres-target psql -U datawarehouse -d analytics_dwh -c "\dt
+```
+4. Ngoài ra kiểm tra bảng legacy cũ:
+```bash
+   docker exec -it dataops-postgres-target psql -U datawarehouse -d analytics_dwh -c "\dt orders_staging"
+```
+5. Sau một run thành công, không nên còn bảng staging.
+
+### Run ở trạng thái Queued
+
+**Hiện tượng:** Bấm Materialize, run xuất hiện nhưng ở trạng thái `Queued`.
+
+Có hai trường hợp:
+
+#### Trường hợp 1: Queued bình thường
+
+Nếu đã có một run khác đang chạy, run mới sẽ chờ. Đây là hành vi đúng vì hệ thống đang cấu hình single-flight execution:
+
+```yaml
+max_concurrent_runs: 1
 ```
 
-### Lỗi: Run stuck ở trạng thái "Queued" mãi mãi
+Chờ run hiện tại hoàn thành, daemon sẽ dequeue run kế tiếp.
 
-**Hiện tượng:** Bấm Materialize, Run được tạo nhưng không bao giờ chuyển sang Running. Tab **Deployment** có icon cảnh báo ⚠️ màu vàng.
+#### Trường hợp 2: Queued bất thường
 
-**Nguyên nhân:** Dagster Control Plane gồm 2 thành phần độc lập:
+Nếu không có run nào đang chạy nhưng run vẫn `Queued` lâu hơn vài phút.
 
-- **Webserver** (`dagster-platform`): chỉ nhận yêu cầu từ UI và ghi run vào queue.
-- **Daemon** (`dagster-daemon`): vòng lặp nền lấy run từ queue ra để thực thi.
+**Nguyên nhân có thể:**
 
-Nếu thiếu Daemon, mọi run sẽ nằm trong queue vĩnh viễn.
+- `dagster-daemon` không chạy.
+- Daemon bị crash.
+- Daemon mất kết nối với metadata database.
+- Metadata database unhealthy.
 
 **Giải pháp:**
 
-1. Đảm bảo service `dagster-daemon` tồn tại trong `docker-compose.yml`.
-2. Kiểm tra logs daemon:
-
 ```bash
-   docker compose logs dagster-daemon --tail=30
+docker compose ps
+docker compose logs dagster-daemon --tail=50
+docker compose logs dagster-metadata --tail=50
 ```
 
-3. Kỳ vọng thấy các dòng heartbeat INFO, không có cảnh báo "Another daemon is still sending heartbeats".
+**Kỳ vọng:**
+
+- Container `dataops-dagster-daemon` đang `Up`.
+- Log daemon không có lỗi fatal.
+- Không có cảnh báo split-brain kéo dài.
 
 ---
 
@@ -548,6 +601,41 @@ Giải pháp:
 4. Xóa volume `dagster_storage` nếu nghi ngờ config cũ còn tồn tại.
 5. Build và recreate lại toàn bộ lab.
 
+### Xuất hiện bảng orders_stg_* trong PostgreSQL
+**Hiện tượng:** Trong PostgreSQL target có bảng dạng:
+```
+orders_stg_20260616123045_ab12cd34
+```
+Đây là bảng staging theo run.
+
+**Hành vi bình thường:**
+
+- Trong khi run đang chạy, bảng staging có thể tồn tại.
+- Sau khi run thành công, bảng staging được rename thành `orders_production`.
+- Sau run kế tiếp, staging orphan từ run cũ sẽ được cleanup.
+
+**Hành vi bất thường:**
+
+- Nếu run đã `succeeded` nhưng vẫn còn bảng `orders_stg_*`, cần kiểm tra lại log run.
+- Nếu run `failed` và staging còn tồn tại, run kế tiếp sẽ cleanup.
+- Không nên xóa tay bảng staging khi chưa xác định run liên quan, trừ khi bạn chắc chắn đó là orphan.
+
+
+---
+### Xuất hiện bảng `orders_production_backup`
+
+Đây là hành vi có chủ đích.
+
+Hệ thống giữ lại một thế hệ backup của `orders_production` để hỗ trợ rollback ngắn hạn.
+
+Bảng này:
+
+- Không phải bảng production.
+- Không nên được dùng trực tiếp cho dashboard.
+- Sẽ bị drop ở lần swap kế tiếp.
+
+Nếu bạn cần rollback khẩn cấp, tham khảo phần Disaster Recovery trong `ARCHITECTURE.md`.
+
 ---
 
 ## ❓ FAQ
@@ -590,6 +678,29 @@ A: Không, nếu bạn chỉ tắt máy thông thường. Dữ liệu được l
 
 A: Vào Dagster UI → Tab **"Runs"**. Tất cả lịch sử chạy, logs, thời gian, trạng thái đều được lưu ở đây.
 
+
+**Q: Vì sao run của tôi ở trạng thái Queued?**
+
+A: Vì hệ thống đang cấu hình single-flight execution. Nếu đã có một run đang chạy, run mới sẽ chờ. Đây là hành vi bình thường. Nếu không có run nào chạy mà run vẫn Queued lâu, hãy kiểm tra `dagster-daemon`.
+
+
+**Q: Vì sao có bảng `orders_production_backup`?**
+
+A: Hệ thống giữ một thế hệ backup của bảng production để hỗ trợ rollback ngắn hạn. Bảng này sẽ bị thay thế hoặc drop ở lần swap kế tiếp.
+
+
+**Q: Vì sao có bảng `orders_stg_*`?**
+
+A: Đây là bảng staging theo run. Mỗi pipeline run tạo một staging table riêng để tránh conflict và hỗ trợ forensic. Sau run thành công, staging được swap thành production. Nếu run crash, staging orphan sẽ được cleanup ở run kế tiếp.
+
+
+**Q: Tôi có nên retry run cũ không?**
+
+A: Nếu run cũ `failed` và chưa có run mới thay thế, bạn có thể retry. Nhưng nếu đã có run mới chạy thành công, không nên retry run cũ. Hãy tạo một run mới để tránh dùng staging cũ không rõ nguồn gốc.
+
+**Q: Vì sao source trả về 0 rows làm pipeline fail?**
+
+A: Hiện tại lab cấu hình `MIN_EXPECTED_ROWS = 1` để fail-fast khi source bất thường. Nếu nghiệp vụ cho phép source rỗng, hãy đổi `MIN_EXPECTED_ROWS = 0` trong `user_code/contracts/order_contract.py`.
 ---
 
 ## 🤝 Liên hệ & Hỗ trợ

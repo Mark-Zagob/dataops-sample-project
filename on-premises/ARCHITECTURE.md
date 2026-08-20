@@ -1,8 +1,15 @@
 # 🏛️ Data Platform Architecture - Production-Grade Lab
 
-**Version:** 1.0  
+**Version:** 1.1  
 **Status:** Approved  
-**Owner:** Platform Engineering Team
+**Owner:** Platform Engineering Team  
+
+## Change Log
+
+| Version | Date | Change |
+|---|---|---|
+| 1.0 | Initial version | Architecture gốc với Atomic Swap, Data Contract, Control Plane / Data Plane separation |
+| 1.1 | Current | Bổ sung concurrency control, run-scoped staging, orphan cleanup, advisory lock, backup retention |
 
 ---
 
@@ -24,15 +31,67 @@ Dự án này xây dựng một **Data Platform Self-serve** trên môi trườn
 
 ## 3. Core DataOps Patterns (Mẫu hình DataOps cốt lõi)
 
-### 3.1. Idempotency via Atomic Swap (Pattern C)
+### 3.1. Idempotency via Atomic Swap + Single-flight Execution (Pattern C+)
 
-- **Vấn đề:** Truncate & Load trực tiếp gây rủi ro Data Blackout. Upsert/Merge tốn tài nguyên Index lookup khi dữ liệu lớn.
-- **Giải pháp:**
-  1. Load dữ liệu mới vào bảng `orders_staging` (ẩn).
-  2. Chạy Data Quality Checks trên bảng Staging.
-  3. Nếu Pass, thực hiện **Atomic Swap**: Đổi tên `orders_staging` → `orders_production` và ngược lại.
-  4. Nếu Fail, hủy bảng Staging. Bảng Production cũ vẫn nguyên vẹn.
-- **Lợi ích:** Zero-downtime deployment cho dữ liệu. Tương tự Blue/Green Deployment trong DevOps.
+**Vấn đề:**
+
+- Truncate & Load trực tiếp gây rủi ro Data Blackout.
+- Upsert/Merge tốn tài nguyên index lookup khi dữ liệu lớn.
+- Nếu có hai pipeline runs chạy đồng thời, bảng staging cố định có thể bị conflict.
+- Nếu run trước crash giữa chừng, run sau có thể kế thừa trạng thái staging không rõ nguồn gốc.
+
+**Giải pháp:**
+
+Pipeline hiện tại kết hợp nhiều lớp bảo vệ:
+
+1. **Single-flight execution ở Control Plane**
+   - Dùng `QueuedRunCoordinator`.
+   - `max_concurrent_runs: 1`.
+   - Tại một thời điểm chỉ có một Dagster run được thực thi.
+   - Các run khác sẽ ở trạng thái `QUEUED`.
+
+2. **Run-scoped staging table**
+   - Mỗi run tạo một bảng staging riêng, ví dụ: `orders_stg_20260616123045_ab12cd34`.
+   - Tránh conflict nếu có race condition hoặc cấu hình sai.
+   - Dễ forensic và debug.
+
+3. **Orphan staging cleanup**
+   - Ở đầu bước staging, pipeline dọn dẹp các bảng `orders_stg_*` orphan từ run trước.
+   - An toàn vì Control Plane đang giới hạn single-flight.
+
+4. **Data Quality Checks trước khi swap**
+   - Kiểm tra NULL ở các cột bắt buộc.
+   - Kiểm tra `amount < 0`.
+   - Kiểm tra duplicate `order_id`.
+   - Kiểm tra row count tối thiểu.
+
+5. **Atomic Swap với advisory lock**
+   - Swap được thực hiện trong một PostgreSQL transaction.
+   - Dùng `pg_advisory_xact_lock` để giảm rủi ro concurrent swap.
+
+6. **Backup retention một thế hệ**
+   - Bảng production cũ được rename thành `orders_production_backup`.
+   - Backup này được giữ lại cho đến lần swap kế tiếp.
+   - Hỗ trợ rollback ngắn hạn.
+
+**Luồng swap hiện tại:**
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(906033);
+DROP TABLE IF EXISTS orders_production_backup;
+ALTER TABLE orders_production RENAME TO orders_production_backup;
+ALTER TABLE orders_stg_<run_id> RENAME TO orders_production;
+COMMIT;
+```
+
+**Lợi ích:**
+
+- Zero-downtime deployment cho dữ liệu.
+- Không có Data Blackout.
+- Production cũ vẫn có thể dùng để rollback ngắn hạn.
+- Giảm rủi ro concurrent execution.
+- Tăng khả năng phục hồi và forensic.
 
 ### 3.2. Data Contracts & Schema Validation
 
@@ -40,6 +99,44 @@ Dự án này xây dựng một **Data Platform Self-serve** trên môi trườn
 - **Giải pháp:** Đặt một **Contract Validator** ở đầu pipeline. Nó so sánh schema thực tế của Source với bản Contract đã thỏa thuận.
 - **Hành vi khi vi phạm:** **FAIL-FAST**. Dừng toàn bộ pipeline, gửi Alert, không cho phép bất kỳ dữ liệu nào đi vào Staging.
 
+
+### 3.3. Concurrency Control & State Ownership
+
+**Vấn đề:**
+
+Data Pipeline không chỉ cần đúng về mặt dữ liệu, mà còn cần an toàn khi có nhiều người hoặc nhiều trigger cùng lúc:
+
+- Hai Data Engineer cùng bấm Materialize.
+- Schedule trigger trong khi một manual run đang chạy.
+- Run trước crash và để lại staging orphan.
+- Retry một run cũ sau khi đã có run mới.
+
+**Thiết kế hiện tại:**
+
+| Cơ chế | Mục đích |
+|---|---|
+| `QueuedRunCoordinator` | Giới hạn số run chạy đồng thời |
+| `max_concurrent_runs: 1` | Single-flight execution cho lab hiện tại |
+| Run-scoped staging table | Tránh conflict giữa các run |
+| Orphan staging cleanup | Dọn dẹp trạng thái còn sót lại từ run trước |
+| PostgreSQL advisory lock | Serialize bước Atomic Swap |
+| Backup retention một thế hệ | Hỗ trợ rollback ngắn hạn |
+
+**Hành vi vận hành:**
+
+- Nếu có nhiều run được trigger, chỉ một run chạy tại một thời điểm.
+- Các run còn lại ở trạng thái `QUEUED`.
+- `QUEUED` không phải lỗi, đây là hành vi bảo vệ hệ thống.
+- Nếu run queued quá lâu, cần kiểm tra daemon và run queue.
+
+**SLI gợi ý:**
+
+| SLI | Ngưỡng cảnh báo |
+|---|---|
+| Time a run spends in QUEUED state | > 5 phút |
+| Number of concurrently running runs | > 1 |
+| Orphan staging tables after successful run | > 0 |
+| Number of production backup tables | > 1 |
 ---
 
 ## 4. System Architecture (Kiến trúc hệ thống)
@@ -111,32 +208,84 @@ flowchart TB
 
 ### 5.1. Happy Path (Luồng thành công)
 
-1. **Trigger:** Dagster Daemon đánh thức pipeline lúc 06:00 AM.
-2. **Step 1 - Validate:** `Contract Validator` kết nối MySQL, đọc schema bảng `orders`. So sánh với Contract (cột `order_id`, `amount`, `created_at`). → **PASS**.
-3. **Step 2 - Extract & Load Staging:** `ETL Engine` kết nối MySQL, SELECT dữ liệu 24h qua. INSERT vào bảng `orders_staging` trong PostgreSQL.
-4. **Step 3 - Quality Check:** Kiểm tra `orders_staging` không bị NULL primary key, không bị âm doanh thu. → **PASS**.
-5. **Step 4 - Atomic Swap:** Dagster chạy transaction:
+1. **Trigger**
+   - Data Engineer bấm Materialize từ UI, hoặc chạy `orders_pipeline_job`.
+   - Nếu đã có một run đang chạy, run mới sẽ ở trạng thái `QUEUED`.
 
-```sql
-   BEGIN;
-   ALTER TABLE orders_production RENAME TO orders_backup;
-   ALTER TABLE orders_staging RENAME TO orders_production;
-   DROP TABLE orders_backup;
-   COMMIT;
-```
+2. **Step 1 - Validate**
+   - `Contract Validator` kết nối MySQL.
+   - Đọc schema thực tế của bảng `orders`.
+   - So sánh với Data Contract.
+   - Nếu pass, pipeline tiếp tục.
+   - Nếu fail, pipeline dừng ngay lập tức.
 
-6. **Step 5 - Notify:** Gửi Alert Success. CEO mở dashboard thấy dữ liệu mới.
+3. **Step 2 - Extract & Load to Run-scoped Staging**
+   - ETL Engine đọc dữ liệu từ MySQL.
+   - Cleanup các bảng staging orphan nếu có.
+   - Tạo bảng staging mới theo run, ví dụ:
+     `orders_stg_20260616123045_ab12cd34`.
+   - Insert dữ liệu vào bảng staging.
 
-### 5.2. Failure Path: Schema Drift (Luồng lỗi Schema)
+4. **Step 3 - Quality Check**
+   - Kiểm tra NULL ở các cột bắt buộc.
+   - Kiểm tra `amount < 0`.
+   - Kiểm tra duplicate `order_id`.
+   - Kiểm tra row count tối thiểu.
+   - Nếu fail, pipeline dừng và không swap vào production.
 
-1. **Trigger:** 06:00 AM.
-2. **Step 1 - Validate:** Source DB đã đổi tên cột `order_id` → `transaction_id`. Contract Validator phát hiện sai lệch. → **FAIL**.
-3. **Hành động:**
-   - Pipeline **DỪNG NGAY LẬP TỨC**. Không chạy Step 2, 3, 4.
-   - Dagster UI hiển thị Asset `orders_staging` trạng thái **FAILED**.
-   - Asset downstream `orders_production` và `ceo_dashboard` chuyển trạng thái **AT RISK / STALE**.
-   - Gửi Alert chi tiết: *"Schema Violation: Expected 'order_id', found 'transaction_id'"*.
-4. **Kết quả:** Bảng `orders_production` vẫn chứa dữ liệu cũ (an toàn). Không có Data Blackout. Data Engineer biết chính xác nguyên nhân để sửa.
+5. **Step 4 - Atomic Swap**
+   - PostgreSQL transaction thực hiện:
+     - Lấy advisory lock.
+     - Drop backup cũ nếu có.
+     - Rename `orders_production` hiện tại thành `orders_production_backup`.
+     - Rename bảng staging theo run thành `orders_production`.
+     - Commit.
+
+6. **Step 5 - Post-swap state**
+   - `orders_production` chứa dữ liệu mới.
+   - `orders_production_backup` chứa dữ liệu của thế hệ production trước.
+   - Không còn bảng staging của run hiện tại.
+
+7. **Step 6 - Notify / Observe**
+   - Dagster UI hiển thị run succeeded.
+   - Asset lineage thể hiện trạng thái success.
+   - CEO/Data Analyst có thể đọc dữ liệu mới từ `orders_production`.
+
+### 5.2. Failure Path: Schema Drift
+
+Hành vi vẫn giữ nguyên:
+
+- Contract Validator phát hiện schema drift.
+- Pipeline fail-fast.
+- Không có dữ liệu nào đi vào staging.
+- Không có Atomic Swap.
+- `orders_production` vẫn chứa dữ liệu cũ.
+
+### 5.3. Failure Path: Run Crash ở Staging
+
+Nếu run crash sau khi tạo staging nhưng trước khi swap:
+
+- Bảng staging theo run có thể còn tồn tại.
+- Run kế tiếp sẽ cleanup các bảng staging orphan ở đầu bước staging.
+- Production không bị ảnh hưởng nếu swap chưa xảy ra.
+
+### 5.4. Failure Path: Atomic Swap Fail
+
+Nếu Atomic Swap fail trước khi commit:
+
+- PostgreSQL rollback transaction.
+- `orders_production` cũ vẫn an toàn.
+- Bảng staging có thể còn tồn tại.
+- Run kế tiếp sẽ cleanup staging orphan.
+
+### 5.5. Failure Path: Retry Run Cũ
+
+Nếu retry một run cũ sau khi đã có run mới chạy thành công:
+
+- Bảng staging của run cũ có thể đã bị cleanup.
+- Retry có thể fail vì không tìm thấy staging.
+- Đây là hành vi an toàn, tránh swap dữ liệu cũ không rõ nguồn gốc vào production.
+- Khuyến nghị: khi cần chạy lại, tạo một Materialization/Job run mới.
 
 ---
 
@@ -227,6 +376,16 @@ SLO gợi ý cho metadata database:
 
 > Tham khảo Mini-PRR của từng pipeline trong [docs/reliability/](./docs/reliability/).
 
+### SLI bổ sung cho Concurrency & Queue
+
+| SLI | Ý nghĩa | Ngưỡng cảnh báo |
+|---|---|---|
+| Run queue latency | Thời gian run nằm ở trạng thái QUEUED | > 5 phút |
+| Concurrent running runs | Số run đang chạy đồng thời | > 1 |
+| Daemon heartbeat freshness | Daemon còn sống và dequeue run | > 2 phút không có heartbeat |
+| Orphan staging tables | Bảng staging còn tồn tại sau run thành công | > 0 |
+| Backup table count | Số bảng backup production | > 1 |
+
 ### 7.1. SLO / SLA Design
 
 - **Data Freshness:** 95% số ngày trong tháng, dữ liệu `orders_production` phải sẵn sàng trước **07:30 AM**.
@@ -241,10 +400,43 @@ SLO gợi ý cho metadata database:
 
 ### 7.3. Disaster Recovery (Phục hồi thảm họa)
 
-- Nếu Atomic Swap fail giữa chừng: Transaction bị rollback. Bảng Production không bị ảnh hưởng.
-- Nếu PostgreSQL Volume bị hỏng: Restore từ backup (cần thiết lập backup job riêng - ngoài phạm vi lab này).
-- Nếu Dagster Container crash: Docker restart tự động (`restart: always`). Các Run đang dang dở sẽ được đánh dấu failed và có thể Retry từ UI.
+#### Atomic Swap fail giữa chừng
 
+- Transaction bị rollback.
+- Bảng production cũ không bị ảnh hưởng.
+- Không có Data Blackout.
+
+#### Pipeline tạo ra dữ liệu xấu nhưng đã swap thành công
+
+Hệ thống giữ một bảng backup: `orders_production_backup`
+
+Có thể rollback khẩn cấp bằng `psql`:
+
+```sql
+BEGIN;
+ALTER TABLE orders_production RENAME TO orders_production_bad;
+ALTER TABLE orders_production_backup RENAME TO orders_production;
+DROP TABLE orders_production_bad;
+COMMIT;
+```
+
+> ⚠️ **Lưu ý:**
+> - Backup chỉ được giữ lại một thế hệ.
+> - Backup sẽ bị drop ở lần swap kế tiếp.
+> - Rollback từ backup là biện pháp khẩn cấp, không thay thế việc điều tra root cause.
+
+#### PostgreSQL Volume bị hỏng
+
+- Restore từ backup bên ngoài.
+- Cần thiết lập backup job riêng cho PostgreSQL target và Dagster metadata.
+- Backup job hiện tại ngoài phạm vi lab.
+
+#### Dagster container crash
+
+- Docker restart tự động nhờ `restart: always`.
+- Run đang dang dở có thể được đánh dấu `failed`.
+- Có thể retry từ UI hoặc chạy job mới.
+- Nếu run queued quá lâu, cần kiểm tra daemon.
 ### 7.4. Control Plane Health & Split-Brain Prevention
 
 Dagster Daemon sử dụng cơ chế **leader election bằng heartbeat** trên Instance Storage
