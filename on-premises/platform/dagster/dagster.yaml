@@ -5,6 +5,7 @@
 # - Run storage: PostgreSQL
 # - Event log storage: PostgreSQL
 # - Schedule storage: PostgreSQL
+# - Run coordinator: QueuedRunCoordinator
 #
 # Compatible với dagster-postgres==0.26.2
 # =================================================================
@@ -57,3 +58,35 @@ schedule_storage:
 run_launcher:
   module: dagster.core.launcher
   class: DefaultRunLauncher
+
+# =================================================================
+# RUN COORDINATOR: SINGLE-FLIGHT EXECUTION
+# =================================================================
+# max_concurrent_runs: 1 đảm bảo chỉ có 1 run được chạy tại một thời điểm.
+# Các run khác sẽ ở trạng thái QUEUED và được daemon dequeue sau.
+#
+# Đây là lựa chọn an toàn cho lab hiện tại vì chỉ có 1 pipeline orders.
+# Khi có nhiều pipeline, ta sẽ chuyển sang tag_concurrency_limits.
+# =================================================================
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 1
+    dequeue_interval_seconds: 5
+
+    # -------------------------------------------------------------
+    # FUTURE: Per-pipeline single-flight
+    # -------------------------------------------------------------
+    # Khi có nhiều pipeline và muốn giới hạn theo từng pipeline:
+    #
+    # max_concurrent_runs: 5
+    # tag_concurrency_limits:
+    #   - key: pipeline
+    #     value: orders
+    #     limit: 1
+    #
+    # Lưu ý: tag-based limit chỉ hoạt động chắc chắn khi run được tạo
+    # với tag phù hợp, ví dụ chạy qua job/schedule có tag.
+    # Với manual Materialize từ UI, cần thận trọng hơn.
+    # -------------------------------------------------------------

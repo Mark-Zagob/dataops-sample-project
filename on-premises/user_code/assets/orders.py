@@ -2,42 +2,60 @@
 =================================================================
 DATA ASSETS: Orders Pipeline
 =================================================================
-Pipeline này thể hiện 3 bước cốt lõi của DataOps Production-grade:
-1. Contract Validation (Fail-Fast)
-2. ETL: Extract from MySQL -> Load to PostgreSQL Staging
-3. Atomic Swap: Staging -> Production
+Pipeline này thể hiện các bước cốt lõi của DataOps Production-grade:
 
-Mỗi @asset đại diện cho một "Tài sản dữ liệu" (Data Asset).
-Dagster sẽ tự động quản lý dependency giữa chúng.
+1. Contract Validation (Fail-Fast)
+2. ETL: Extract from MySQL -> Load to run-scoped PostgreSQL Staging
+3. Data Quality Checks on Staging
+4. Atomic Swap: Staging -> Production
+
+Các cải tiến chính trong phiên bản này:
+
+- QueuedRunCoordinator giới hạn 1 run chạy đồng thời ở Control Plane.
+- Staging table được đặt tên theo run để tránh conflict.
+- Cleanup staging orphan ở đầu bước staging.
+- Data quality check fail-fast trước khi swap.
+- Atomic Swap dùng PostgreSQL advisory lock để giảm rủi ro concurrent swap.
+- Giữ lại một bảng backup để tăng khả năng phục hồi ngắn hạn.
 """
 
 import os
-from typing import Dict, Any
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict
 
 import pandas as pd
 import pymysql
 import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import execute_values
+
 from dagster import asset, AssetExecutionContext, MetadataValue
 
-# Import Data Contract
 from user_code.contracts.order_contract import (
     EXPECTED_ORDERS_SCHEMA,
     REQUIRED_COLUMNS,
     SOURCE_TABLE_NAME,
-    STAGING_TABLE_NAME,
     PRODUCTION_TABLE_NAME,
+    STAGING_TABLE_PREFIX,
+    LEGACY_STAGING_TABLE_NAME,
+    TARGET_COLUMNS,
+    ORDERS_PIPELINE_LOCK_KEY,
+    MIN_EXPECTED_ROWS,
 )
 
 
 # =================================================================
-# Helper Functions (Các hàm tiện ích)
+# Helper Functions
 # =================================================================
 
 def get_mysql_connection():
-    """Tạo kết nối đến MySQL Source."""
+    """
+    Tạo kết nối đến MySQL Source.
+    """
     return pymysql.connect(
         host=os.environ.get("MYSQL_HOST", "localhost"),
-        port=int(os.environ.get("MYSQL_PORT", 3306)),
+        port=int(os.environ.get("MYSQL_PORT", "3306")),
         user=os.environ.get("MYSQL_USER", "datauser"),
         password=os.environ.get("MYSQL_PASSWORD", "datapassword"),
         database=os.environ.get("MYSQL_DATABASE", "sales_db"),
@@ -46,185 +64,405 @@ def get_mysql_connection():
 
 
 def get_postgres_connection():
-    """Tạo kết nối đến PostgreSQL Target."""
+    """
+    Tạo kết nối đến PostgreSQL Target.
+    """
     return psycopg2.connect(
         host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", 5432)),
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
         user=os.environ.get("POSTGRES_USER", "datawarehouse"),
         password=os.environ.get("POSTGRES_PASSWORD", "dwhpassword"),
         database=os.environ.get("POSTGRES_DATABASE", "analytics_dwh"),
     )
 
 
+def _run_scoped_staging_table(run_id: str) -> str:
+    """
+    Tạo tên bảng staging theo run.
+
+    Ví dụ:
+        orders_stg_20260616123045_ab12cd34
+
+    Lợi ích:
+    - Tránh conflict nếu có nhiều run chạy đồng thời do cấu hình sai.
+    - Dễ forensic.
+    - Cleanup orphan rõ ràng hơn.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    safe_run_id = re.sub(r"[^a-z0-9]", "", run_id.lower())[-8:]
+
+    if not safe_run_id:
+        safe_run_id = "unknown"
+
+    return f"{STAGING_TABLE_PREFIX}{timestamp}_{safe_run_id}"
+
+
+def _table_exists(cursor, table_name: str) -> bool:
+    """
+    Kiểm tra bảng có tồn tại trong schema public hay không.
+    """
+    cursor.execute("SELECT to_regclass(%s)", (table_name,))
+    return cursor.fetchone()[0] is not None
+
+
+def _drop_orphan_staging_tables(cursor) -> None:
+    """
+    Dọn dẹp các bảng staging orphan.
+
+    Giả định an toàn:
+    - Control Plane đang giới hạn 1 run chạy đồng thời.
+    - Nếu có bảng staging tồn tại trước khi run mới bắt đầu,
+      đó là orphan từ run trước hoặc bảng test.
+
+    Nếu sau này bạn cho phép nhiều pipeline chạy song song,
+    không được cleanup mạnh tay như thế này mà cần lock/ownership
+    chi tiết hơn theo run hoặc theo pipeline.
+    """
+    cursor.execute(
+        """
+        SELECT tablename
+        FROM pg_catalog.pg_tables
+        WHERE schemaname = 'public'
+          AND tablename LIKE %s
+        """,
+        (STAGING_TABLE_PREFIX + "%",),
+    )
+
+    orphan_tables = [row[0] for row in cursor.fetchall()]
+
+    for table_name in orphan_tables:
+        cursor.execute(
+            sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table_name))
+        )
+
+    # Cleanup bảng staging cố định của kiến trúc cũ, nếu còn.
+    cursor.execute(
+        sql.SQL("DROP TABLE IF EXISTS {}").format(
+            sql.Identifier(LEGACY_STAGING_TABLE_NAME)
+        )
+    )
+
+
 # =================================================================
-# ASSET 1: Contract Validation (Chốt chặn Schema)
+# ASSET 1: Contract Validation
 # =================================================================
-# Asset này KHÔNG tạo ra dữ liệu. Nó tạo ra "Sự an tâm".
-# Nếu validation fail, Dagster sẽ dừng toàn bộ pipeline ngay lập tức.
-# Đây là hiện thực hóa của khái niệm "Fail-Fast over Silent Corruption".
 
 @asset(
     name="validate_orders_schema",
-    description="Kiểm tra schema MySQL Source có khớp với Data Contract không. Fail-fast nếu sai lệch.",
+    description=(
+        "Kiểm tra schema MySQL Source có khớp với Data Contract không. "
+        "Fail-fast nếu sai lệch."
+    ),
     group_name="orders_pipeline",
+    tags={"pipeline": "orders", "stage": "contract"},
 )
 def validate_orders_schema(context: AssetExecutionContext) -> Dict[str, Any]:
     """
     Kết nối MySQL, đọc schema thực tế của bảng orders,
     so sánh với EXPECTED_ORDERS_SCHEMA trong Data Contract.
     """
-    context.log.info("🔍 Bắt đầu kiểm tra Data Contract cho bảng '%s'...", SOURCE_TABLE_NAME)
-    
+    context.log.info(
+        "🔍 Bắt đầu kiểm tra Data Contract cho bảng '%s'...",
+        SOURCE_TABLE_NAME,
+    )
+
     conn = get_mysql_connection()
+
     try:
         with conn.cursor() as cursor:
-            # Lấy thông tin schema thực tế từ MySQL
             cursor.execute(f"DESCRIBE {SOURCE_TABLE_NAME}")
-            actual_schema = {row["Field"]: row["Type"] for row in cursor.fetchall()}
-        
-        context.log.info(f"📋 Schema thực tế từ Source: {list(actual_schema.keys())}")
-        
-        # Kiểm tra 1: Tất cả REQUIRED_COLUMNS phải tồn tại
-        missing_columns = [col for col in REQUIRED_COLUMNS if col not in actual_schema]
+            actual_schema = {
+                row["Field"]: row["Type"] for row in cursor.fetchall()
+            }
+
+        context.log.info(
+            "📋 Schema thực tế từ Source: %s",
+            list(actual_schema.keys()),
+        )
+
+        # Kiểm tra 1: Tất cả REQUIRED_COLUMNS phải tồn tại.
+        missing_columns = [
+            col for col in REQUIRED_COLUMNS if col not in actual_schema
+        ]
+
         if missing_columns:
             error_msg = (
-                f"❌ DATA CONTRACT VIOLATION! "
+                "❌ DATA CONTRACT VIOLATION! "
                 f"Thiếu các cột bắt buộc: {missing_columns}. "
                 f"Schema thực tế: {list(actual_schema.keys())}"
             )
             context.log.error(error_msg)
-            # Raise exception để Dagster đánh dấu asset này FAILED
-            # và KHÔNG chạy các asset downstream
             raise ValueError(error_msg)
-        
-        # Kiểm tra 2: Kiểu dữ liệu phải khớp (kiểm tra cơ bản)
+
+        # Kiểm tra 2: Kiểu dữ liệu phải khớp ở mức cơ bản.
         type_mismatches = []
+
         for col, expected_type in EXPECTED_ORDERS_SCHEMA.items():
             if col in actual_schema:
                 actual_type = actual_schema[col].lower()
-                # Kiểm tra đơn giản: xem expected_type có phải là prefix của actual_type không
-                # Ví dụ: expected "int" khớp với actual "int(11)"
+
                 if not actual_type.startswith(expected_type):
                     type_mismatches.append(
-                        f"Cột '{col}': Kỳ vọng '{expected_type}', Thực tế '{actual_type}'"
+                        f"Cột '{col}': Kỳ vọng '{expected_type}', "
+                        f"Thực tế '{actual_type}'"
                     )
-        
+
         if type_mismatches:
             error_msg = (
-                f"❌ DATA CONTRACT VIOLATION! "
+                "❌ DATA CONTRACT VIOLATION! "
                 f"Sai lệch kiểu dữ liệu: {type_mismatches}"
             )
             context.log.error(error_msg)
             raise ValueError(error_msg)
-        
-        context.log.info("✅ Data Contract validation PASSED! Schema khớp với hợp đồng.")
-        
-        # Ghi metadata vào Dagster UI để Data Engineer có thể quan sát
-        context.add_output_metadata({
-            "validated_columns": MetadataValue.json(list(actual_schema.keys())),
-            "contract_version": MetadataValue.text("v1.0"),
-            "source_table": MetadataValue.text(SOURCE_TABLE_NAME),
-        })
-        
-        return {"status": "passed", "columns_validated": len(actual_schema)}
-    
+
+        context.log.info(
+            "✅ Data Contract validation PASSED! Schema khớp với hợp đồng."
+        )
+
+        context.add_output_metadata(
+            {
+                "validated_columns": MetadataValue.json(list(actual_schema.keys())),
+                "contract_version": MetadataValue.text("v1.1"),
+                "source_table": MetadataValue.text(SOURCE_TABLE_NAME),
+            }
+        )
+
+        return {
+            "status": "passed",
+            "columns_validated": len(actual_schema),
+        }
+
     except pymysql.Error as e:
         context.log.error(f"❌ Không thể kết nối MySQL Source: {e}")
         raise
+
     finally:
         conn.close()
 
 
 # =================================================================
-# ASSET 2: ETL - Extract & Load to Staging
+# ASSET 2: ETL - Extract & Load to Run-scoped Staging
 # =================================================================
-# Asset này phụ thuộc vào validate_orders_schema.
-# Chỉ chạy khi validation PASSED.
 
 @asset(
     name="orders_staging",
-    deps=[validate_orders_schema],  # Dependency: Chạy sau khi validation pass
-    description="Extract dữ liệu từ MySQL và Load vào bảng Staging trong PostgreSQL.",
+    description=(
+        "Extract dữ liệu từ MySQL và Load vào bảng staging theo run trong PostgreSQL. "
+        "Bao gồm cleanup orphan staging và data quality checks."
+    ),
     group_name="orders_pipeline",
+    tags={"pipeline": "orders", "stage": "staging"},
 )
-def orders_staging(context: AssetExecutionContext) -> Dict[str, Any]:
+def orders_staging(context: AssetExecutionContext) -> str:
     """
-    1. Kết nối MySQL, SELECT toàn bộ dữ liệu từ bảng orders.
-    2. Kết nối PostgreSQL, DROP bảng staging cũ (nếu có).
-    3. CREATE bảng staging mới.
-    4. INSERT dữ liệu vào bảng staging.
+    1. Extract dữ liệu từ MySQL.
+    2. Cleanup staging orphan.
+    3. Tạo bảng staging mới theo run.
+    4. INSERT dữ liệu vào staging.
+    5. Chạy data quality checks.
+    6. Trả về tên bảng staging cho asset production.
     """
-    context.log.info("🚀 Bắt đầu ETL: MySQL -> PostgreSQL Staging...")
-    
+    staging_table = _run_scoped_staging_table(context.run_id)
+
+    context.log.info(
+        "🚀 Bắt đầu ETL: MySQL -> PostgreSQL Staging. Staging table: %s",
+        staging_table,
+    )
+
+    # -------------------------------------------------------------
     # Step 1: Extract từ MySQL
+    # -------------------------------------------------------------
     mysql_conn = get_mysql_connection()
+
     try:
         with mysql_conn.cursor() as cursor:
-            cursor.execute(f"SELECT * FROM {SOURCE_TABLE_NAME}")
+            select_columns = ", ".join(TARGET_COLUMNS)
+            cursor.execute(
+                f"SELECT {select_columns} FROM {SOURCE_TABLE_NAME}"
+            )
             rows = cursor.fetchall()
-        
-        context.log.info(f"📦 Extracted {len(rows)} rows from MySQL.")
-        
-        if not rows:
-            context.log.warning("⚠️ Không có dữ liệu nào từ Source. Bảng Staging sẽ trống.")
-            return {"rows_loaded": 0}
-        
-        # Chuyển đổi thành DataFrame để dễ xử lý
-        df = pd.DataFrame(rows)
-        
+
     except pymysql.Error as e:
         context.log.error(f"❌ Lỗi khi Extract từ MySQL: {e}")
         raise
+
     finally:
         mysql_conn.close()
-    
-    # Step 2 & 3 & 4: Load vào PostgreSQL Staging
+
+    if len(rows) < MIN_EXPECTED_ROWS:
+        error_msg = (
+            f"❌ Source trả về {len(rows)} rows, "
+            f"nhỏ hơn ngưỡng tối thiểu MIN_EXPECTED_ROWS={MIN_EXPECTED_ROWS}. "
+            "Nếu việc source rỗng là hợp lệ, hãy cấu hình MIN_EXPECTED_ROWS=0 "
+            "trong order_contract.py."
+        )
+        context.log.error(error_msg)
+        raise ValueError(error_msg)
+
+    df = pd.DataFrame(rows, columns=TARGET_COLUMNS)
+
+    # Kiểm tra duplicate primary key trước khi load.
+    duplicate_order_ids = int(df["order_id"].duplicated().sum())
+
+    if duplicate_order_ids > 0:
+        error_msg = (
+            f"❌ Phát hiện {duplicate_order_ids} order_id bị trùng trong source. "
+            "Pipeline fail-fast để tránh corrupt dữ liệu production."
+        )
+        context.log.error(error_msg)
+        raise ValueError(error_msg)
+
+    # -------------------------------------------------------------
+    # Step 2: Load vào PostgreSQL Staging
+    # -------------------------------------------------------------
     pg_conn = get_postgres_connection()
+
     try:
-        with pg_conn.cursor() as cursor:
-            # DROP bảng staging cũ (nếu có)
-            # Đây là bước chuẩn bị cho Atomic Swap
-            cursor.execute(f"DROP TABLE IF EXISTS {STAGING_TABLE_NAME}")
-            context.log.info(f"🗑️ Dropped bảng staging cũ (nếu có).")
-            
-            # CREATE bảng staging mới dựa trên DataFrame schema
-            # Trong production, bạn nên định nghĩa DDL rõ ràng thay vì dynamic như thế này
-            columns_ddl = []
-            for col in df.columns:
-                # Mapping đơn giản từ pandas dtype sang PostgreSQL type
-                if pd.api.types.is_integer_dtype(df[col]):
-                    pg_type = "BIGINT"
-                elif pd.api.types.is_float_dtype(df[col]):
-                    pg_type = "NUMERIC"
-                elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                    pg_type = "TIMESTAMP"
-                else:
-                    pg_type = "TEXT"
-                columns_ddl.append(f"{col} {pg_type}")
-            
-            create_stmt = f"CREATE TABLE {STAGING_TABLE_NAME} ({', '.join(columns_ddl)})"
-            cursor.execute(create_stmt)
-            context.log.info(f"🏗️ Created bảng staging mới: {STAGING_TABLE_NAME}")
-            
-            # INSERT dữ liệu vào bảng staging
-            # Sử dụng executemany để tối ưu performance
-            placeholders = ", ".join(["%s"] * len(df.columns))
-            insert_stmt = f"INSERT INTO {STAGING_TABLE_NAME} ({', '.join(df.columns)}) VALUES ({placeholders})"
-            
-            # Chuyển DataFrame thành list of tuples
-            data_tuples = [tuple(row) for row in df.itertuples(index=False, name=None)]
-            cursor.executemany(insert_stmt, data_tuples)
-            
-            # Commit transaction
-            pg_conn.commit()
-            context.log.info(f"✅ Loaded {len(data_tuples)} rows into {STAGING_TABLE_NAME}.")
-        
-        return {"rows_loaded": len(data_tuples), "staging_table": STAGING_TABLE_NAME}
-    
-    except psycopg2.Error as e:
-        context.log.error(f"❌ Lỗi khi Load vào PostgreSQL: {e}")
+        with pg_conn.cursor() as cur:
+            # Advisory lock giúp serialize bước staging nếu có race bất ngờ.
+            # Lưu ý: lock này chỉ giữ trong transaction của asset này,
+            # không thay thế hoàn toàn single-flight ở Control Plane.
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (ORDERS_PIPELINE_LOCK_KEY,),
+            )
+
+            # Cleanup orphan staging từ run trước.
+            _drop_orphan_staging_tables(cur)
+            context.log.info("🧹 Đã cleanup các bảng staging orphan (nếu có).")
+
+            # Tạo bảng staging mới.
+            staging_ddl = sql.SQL(
+                """
+                CREATE TABLE {} (
+                    order_id BIGINT NOT NULL PRIMARY KEY,
+                    customer_id BIGINT NOT NULL,
+                    amount NUMERIC(10,2) NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+                """
+            ).format(sql.Identifier(staging_table))
+
+            cur.execute(staging_ddl)
+            context.log.info("🏗️ Đã tạo bảng staging mới: %s", staging_table)
+
+            # Chuẩn bị dữ liệu.
+            data_tuples = [
+                tuple(row)
+                for row in df.itertuples(index=False, name=None)
+            ]
+
+            insert_sql = sql.SQL(
+                "INSERT INTO {} ({}) VALUES %s"
+            ).format(
+                sql.Identifier(staging_table),
+                sql.SQL(", ").join(
+                    [sql.Identifier(column) for column in TARGET_COLUMNS]
+                ),
+            ).as_string(cur)
+
+            execute_values(
+                cur,
+                insert_sql,
+                data_tuples,
+                page_size=1000,
+            )
+
+            context.log.info(
+                "✅ Đã INSERT %s rows vào %s.",
+                len(data_tuples),
+                staging_table,
+            )
+
+            # ---------------------------------------------------------
+            # Step 3: Data Quality Checks
+            # ---------------------------------------------------------
+
+            # Check 1: NULL values ở các cột quan trọng.
+            null_check_sql = sql.SQL(
+                """
+                SELECT COUNT(*)
+                FROM {}
+                WHERE order_id IS NULL
+                   OR customer_id IS NULL
+                   OR amount IS NULL
+                   OR status IS NULL
+                   OR created_at IS NULL
+                """
+            ).format(sql.Identifier(staging_table))
+
+            cur.execute(null_check_sql)
+            null_count = cur.fetchone()[0]
+
+            if null_count > 0:
+                error_msg = (
+                    f"❌ Data Quality Check failed: có {null_count} rows chứa NULL "
+                    "ở các cột bắt buộc trong bảng staging."
+                )
+                context.log.error(error_msg)
+                raise ValueError(error_msg)
+
+            # Check 2: Doanh thu âm.
+            negative_amount_sql = sql.SQL(
+                """
+                SELECT COUNT(*)
+                FROM {}
+                WHERE amount < 0
+                """
+            ).format(sql.Identifier(staging_table))
+
+            cur.execute(negative_amount_sql)
+            negative_count = cur.fetchone()[0]
+
+            if negative_count > 0:
+                error_msg = (
+                    f"❌ Data Quality Check failed: có {negative_count} rows "
+                    "có amount < 0 trong bảng staging."
+                )
+                context.log.error(error_msg)
+                raise ValueError(error_msg)
+
+            # Check 3: Row count.
+            row_count_sql = sql.SQL(
+                "SELECT COUNT(*) FROM {}"
+            ).format(sql.Identifier(staging_table))
+
+            cur.execute(row_count_sql)
+            row_count = cur.fetchone()[0]
+
+            if row_count < MIN_EXPECTED_ROWS:
+                error_msg = (
+                    f"❌ Data Quality Check failed: bảng staging chỉ có {row_count} rows, "
+                    f"nhỏ hơn MIN_EXPECTED_ROWS={MIN_EXPECTED_ROWS}."
+                )
+                context.log.error(error_msg)
+                raise ValueError(error_msg)
+
+        pg_conn.commit()
+
+        context.add_output_metadata(
+            {
+                "staging_table": MetadataValue.text(staging_table),
+                "rows_loaded": MetadataValue.text(str(row_count)),
+                "run_id": MetadataValue.text(context.run_id),
+                "pipeline_lock_key": MetadataValue.text(str(ORDERS_PIPELINE_LOCK_KEY)),
+            }
+        )
+
+        context.log.info(
+            "✅ Staging sẵn sàng: %s với %s rows.",
+            staging_table,
+            row_count,
+        )
+
+        return staging_table
+
+    except (psycopg2.Error, ValueError) as e:
         pg_conn.rollback()
+        context.log.error(f"❌ Lỗi khi Load vào PostgreSQL Staging: {e}")
         raise
+
     finally:
         pg_conn.close()
 
@@ -232,82 +470,152 @@ def orders_staging(context: AssetExecutionContext) -> Dict[str, Any]:
 # =================================================================
 # ASSET 3: Atomic Swap - Staging -> Production
 # =================================================================
-# Đây là bước cuối cùng, thể hiện Pattern C (Atomic Swap).
-# Nếu bước này fail, bảng Production cũ vẫn nguyên vẹn.
 
 @asset(
     name="orders_production",
-    deps=[orders_staging],  # Dependency: Chạy sau khi staging load xong
-    description="Atomic Swap: Đổi tên bảng Staging thành Production. Zero-downtime.",
+    description=(
+        "Atomic Swap: Đổi tên bảng staging theo run thành production. "
+        "Zero-downtime. Có advisory lock và giữ backup một thế hệ."
+    ),
     group_name="orders_pipeline",
+    tags={"pipeline": "orders", "stage": "production"},
 )
-def orders_production(context: AssetExecutionContext) -> Dict[str, Any]:
+def orders_production(
+    context: AssetExecutionContext,
+    orders_staging: str,
+) -> Dict[str, Any]:
     """
+    Nhận tên bảng staging từ asset orders_staging.
+
     Thực hiện Atomic Swap trong một transaction:
-    1. Đổi tên bảng Production cũ thành _backup.
-    2. Đổi tên bảng Staging thành Production.
-    3. Xóa bảng _backup.
-    
-    Nếu bất kỳ bước nào fail, toàn bộ transaction sẽ ROLLBACK.
-    Bảng Production cũ vẫn còn nguyên vẹn -> Không có Data Blackout.
+
+    1. Khóa advisory để serialize swap.
+    2. Drop backup cũ nếu có.
+    3. Rename production hiện tại -> backup.
+    4. Rename staging -> production.
+    5. Commit.
+
+    Trong phiên bản này, bảng backup được GIỮ LẠI một thế hệ để hỗ trợ
+    phục hồi nhanh. Nếu bạn muốn theo đúng nguyên bản "DROP backup ngay
+    sau swap", hãy uncomment đoạn DROP backup ở cuối transaction.
     """
-    context.log.info("🔄 Bắt đầu Atomic Swap: Staging -> Production...")
-    
+    staging_table = orders_staging
+    backup_table = f"{PRODUCTION_TABLE_NAME}_backup"
+
+    context.log.info(
+        "🔄 Bắt đầu Atomic Swap: %s -> %s",
+        staging_table,
+        PRODUCTION_TABLE_NAME,
+    )
+
     pg_conn = get_postgres_connection()
+
     try:
-        with pg_conn.cursor() as cursor:
-            # Bắt đầu transaction
-            # PostgreSQL DDL là transactional, nên chúng ta có thể
-            # ROLLBACK cả lệnh ALTER TABLE RENAME nếu có lỗi.
-            
-            # Kiểm tra bảng Production cũ có tồn tại không
-            cursor.execute(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = '{PRODUCTION_TABLE_NAME}'
+        with pg_conn.cursor() as cur:
+            # Advisory lock transaction-scoped.
+            # Nếu có transaction khác đang giữ lock, transaction này sẽ chờ.
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (ORDERS_PIPELINE_LOCK_KEY,),
+            )
+
+            if not _table_exists(cur, staging_table):
+                error_msg = (
+                    f"❌ Không tìm thấy bảng staging {staging_table}. "
+                    "Có thể run cũ đã bị cleanup hoặc bạn đang cố materialize "
+                    "asset production đơn lẻ mà không chạy toàn pipeline."
                 )
-            """)
-            production_exists = cursor.fetchone()[0]
-            
-            backup_table = f"{PRODUCTION_TABLE_NAME}_backup"
-            
-            if production_exists:
-                # Drop bảng backup cũ nếu có (từ lần swap trước bị fail giữa chừng)
-                cursor.execute(f"DROP TABLE IF EXISTS {backup_table}")
-                
-                # Step 1: Rename Production -> Backup
-                cursor.execute(f"ALTER TABLE {PRODUCTION_TABLE_NAME} RENAME TO {backup_table}")
-                context.log.info(f"📦 Renamed {PRODUCTION_TABLE_NAME} -> {backup_table}")
-            
-            # Step 2: Rename Staging -> Production
-            cursor.execute(f"ALTER TABLE {STAGING_TABLE_NAME} RENAME TO {PRODUCTION_TABLE_NAME}")
-            context.log.info(f"✨ Renamed {STAGING_TABLE_NAME} -> {PRODUCTION_TABLE_NAME}")
-            
-            # Step 3: Drop bảng backup (cleanup)
-            if production_exists:
-                cursor.execute(f"DROP TABLE IF EXISTS {backup_table}")
-                context.log.info(f"🗑️ Dropped backup table: {backup_table}")
-            
-            # Commit transaction
-            # Nếu mọi thứ thành công, commit để apply changes
-            pg_conn.commit()
-            context.log.info("✅ Atomic Swap COMPLETED! Dữ liệu mới đã sẵn sàng cho CEO.")
-        
-        # Ghi metadata để quan sát trên Dagster UI
-        context.add_output_metadata({
-            "swap_status": MetadataValue.text("success"),
-            "production_table": MetadataValue.text(PRODUCTION_TABLE_NAME),
-            "previous_production_backed_up": MetadataValue.bool(production_exists),
-        })
-        
-        return {"swap_status": "success", "production_table": PRODUCTION_TABLE_NAME}
-    
-    except psycopg2.Error as e:
-        context.log.error(f"❌ Lỗi khi Atomic Swap: {e}")
-        # ROLLBACK toàn bộ transaction
-        # Bảng Production cũ vẫn còn nguyên vẹn
+                context.log.error(error_msg)
+                raise ValueError(error_msg)
+
+            production_existed = _table_exists(cur, PRODUCTION_TABLE_NAME)
+
+            # Drop backup cũ từ lần swap trước.
+            if _table_exists(cur, backup_table):
+                cur.execute(
+                    sql.SQL("DROP TABLE IF EXISTS {}").format(
+                        sql.Identifier(backup_table)
+                    )
+                )
+                context.log.info("🗑️ Đã drop backup cũ: %s", backup_table)
+
+            # Rename production hiện tại thành backup.
+            if production_existed:
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} RENAME TO {}").format(
+                        sql.Identifier(PRODUCTION_TABLE_NAME),
+                        sql.Identifier(backup_table),
+                    )
+                )
+                context.log.info(
+                    "📦 Renamed %s -> %s",
+                    PRODUCTION_TABLE_NAME,
+                    backup_table,
+                )
+
+            # Rename staging thành production.
+            cur.execute(
+                sql.SQL("ALTER TABLE {} RENAME TO {}").format(
+                    sql.Identifier(staging_table),
+                    sql.Identifier(PRODUCTION_TABLE_NAME),
+                )
+            )
+
+            context.log.info(
+                "✨ Renamed %s -> %s",
+                staging_table,
+                PRODUCTION_TABLE_NAME,
+            )
+
+            # -----------------------------------------------------
+            # OPTION 1: Giữ backup một thế hệ (đang bật)
+            # -----------------------------------------------------
+            # Backup được giữ lại để có thể rollback ngắn hạn.
+            # Backup này sẽ được drop ở lần swap kế tiếp.
+            #
+            # OPTION 2: Drop backup ngay sau swap (giống kiến trúc gốc)
+            # Nếu bạn muốn drop ngay, uncomment đoạn sau:
+            #
+            # if production_existed:
+            #     cur.execute(
+            #         sql.SQL("DROP TABLE IF EXISTS {}").format(
+            #             sql.Identifier(backup_table)
+            #         )
+            #     )
+            #     context.log.info("🗑️ Dropped backup table: %s", backup_table)
+            # -----------------------------------------------------
+
+        pg_conn.commit()
+
+        context.add_output_metadata(
+            {
+                "swap_status": MetadataValue.text("success"),
+                "production_table": MetadataValue.text(PRODUCTION_TABLE_NAME),
+                "staging_table_used": MetadataValue.text(staging_table),
+                "kept_backup_table": MetadataValue.text(
+                    backup_table if production_existed else "none"
+                ),
+            }
+        )
+
+        context.log.info(
+            "✅ Atomic Swap COMPLETED! Dữ liệu mới đã sẵn sàng cho CEO."
+        )
+
+        return {
+            "swap_status": "success",
+            "production_table": PRODUCTION_TABLE_NAME,
+            "staging_table_used": staging_table,
+            "kept_backup_table": backup_table if production_existed else None,
+        }
+
+    except (psycopg2.Error, ValueError) as e:
         pg_conn.rollback()
-        context.log.info("⏪ Transaction ROLLED BACK. Bảng Production cũ vẫn an toàn.")
+        context.log.error(f"❌ Lỗi khi Atomic Swap: {e}")
+        context.log.info(
+            "⏪ Transaction ROLLED BACK. Bảng production cũ vẫn an toàn nếu swap chưa commit."
+        )
         raise
+
     finally:
         pg_conn.close()
