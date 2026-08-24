@@ -33,8 +33,8 @@ from psycopg2.extras import execute_values
 from dagster import asset, AssetExecutionContext, MetadataValue
 
 from user_code.contracts.order_contract import (
-    EXPECTED_ORDERS_SCHEMA,
-    REQUIRED_COLUMNS,
+    ORDER_CONTRACT,
+    classify_schema_change,
     SOURCE_TABLE_NAME,
     PRODUCTION_TABLE_NAME,
     STAGING_TABLE_PREFIX,
@@ -150,17 +150,28 @@ def _drop_orphan_staging_tables(cursor) -> None:
 @asset(
     name="validate_orders_schema",
     description=(
-        "Kiểm tra schema MySQL Source có khớp với Data Contract không. "
-        "Fail-fast nếu sai lệch."
+        "Kiểm tra schema MySQL Source có khớp với Data Contract hay không.  "
+        "Contract được quản lý như một sản phẩm nội bộ: có owner, version, "
+        "consumer, compatibility policy và alert channels."
     ),
     group_name="orders_pipeline",
-    tags={"pipeline": "orders", "stage": "contract"},
+    tags={
+        "pipeline": "orders",
+        "stage": "contract",
+    },
 )
 def validate_orders_schema(context: AssetExecutionContext) -> Dict[str, Any]:
     """
     Kết nối MySQL, đọc schema thực tế của bảng orders,
-    so sánh với EXPECTED_ORDERS_SCHEMA trong Data Contract.
+    sau đó so sánh với Data Contract.
+
+    Hành vi:
+    - Breaking violation: fail-fast.
+    - Additive/unknown column: warning.
+    - Deprecated column: warning.
+    - Ghi metadata contract để dễ audit trong Dagster UI.
     """
+
     context.log.info(
         "🔍 Bắt đầu kiểm tra Data Contract cho bảng '%s'...",
         SOURCE_TABLE_NAME,
@@ -171,69 +182,113 @@ def validate_orders_schema(context: AssetExecutionContext) -> Dict[str, Any]:
     try:
         with conn.cursor() as cursor:
             cursor.execute(f"DESCRIBE {SOURCE_TABLE_NAME}")
+
             actual_schema = {
-                row["Field"]: row["Type"] for row in cursor.fetchall()
+                row["Field"].strip(): row["Type"].strip()
+                for row in cursor.fetchall()
             }
 
         context.log.info(
             "📋 Schema thực tế từ Source: %s",
-            list(actual_schema.keys()),
+            sorted(actual_schema.keys()),
         )
 
-        # Kiểm tra 1: Tất cả REQUIRED_COLUMNS phải tồn tại.
-        missing_columns = [
-            col for col in REQUIRED_COLUMNS if col not in actual_schema
-        ]
+        errors, warnings, compatibility = classify_schema_change(
+            actual_schema,
+            ORDER_CONTRACT,
+        )
 
-        if missing_columns:
-            error_msg = (
+        # ---------------------------------------------------------
+        # Warnings: không chặn pipeline, nhưng phải được ghi nhận
+        # ---------------------------------------------------------
+        for warning in warnings:
+            context.log.warning("⚠️ %s", warning)
+
+        # ---------------------------------------------------------
+        # Errors: breaking changes -> fail-fast
+        # ---------------------------------------------------------
+        if errors:
+            error_message = (
                 "❌ DATA CONTRACT VIOLATION! "
-                f"Thiếu các cột bắt buộc: {missing_columns}. "
-                f"Schema thực tế: {list(actual_schema.keys())}"
+                + "; ".join(errors)
             )
-            context.log.error(error_msg)
-            raise ValueError(error_msg)
 
-        # Kiểm tra 2: Kiểu dữ liệu phải khớp ở mức cơ bản.
-        type_mismatches = []
-
-        for col, expected_type in EXPECTED_ORDERS_SCHEMA.items():
-            if col in actual_schema:
-                actual_type = actual_schema[col].lower()
-
-                if not actual_type.startswith(expected_type):
-                    type_mismatches.append(
-                        f"Cột '{col}': Kỳ vọng '{expected_type}', "
-                        f"Thực tế '{actual_type}'"
-                    )
-
-        if type_mismatches:
-            error_msg = (
-                "❌ DATA CONTRACT VIOLATION! "
-                f"Sai lệch kiểu dữ liệu: {type_mismatches}"
+            context.log.error(error_message)
+            context.log.error(
+                "Owner: %s (%s)",
+                ORDER_CONTRACT["owner_team"],
+                ORDER_CONTRACT["owner_contact"],
             )
-            context.log.error(error_msg)
-            raise ValueError(error_msg)
+            context.log.error(
+                "Producer: %s (%s)",
+                ORDER_CONTRACT["producer_team"],
+                ORDER_CONTRACT["producer_contact"],
+            )
+            context.log.error(
+                "Alert channels: %s",
+                ORDER_CONTRACT["alert_channels"],
+            )
+            context.log.error(
+                "Violation response SLA: %s minutes",
+                ORDER_CONTRACT["violation_response_sla_minutes"],
+            )
+
+            raise ValueError(error_message)
 
         context.log.info(
-            "✅ Data Contract validation PASSED! Schema khớp với hợp đồng."
+            "✅ Data Contract validation PASSED! "
+            "Contract ID: %s, version: %s",
+            ORDER_CONTRACT["contract_id"],
+            ORDER_CONTRACT["version"],
         )
 
         context.add_output_metadata(
             {
-                "validated_columns": MetadataValue.json(list(actual_schema.keys())),
-                "contract_version": MetadataValue.text("v1.1"),
-                "source_table": MetadataValue.text(SOURCE_TABLE_NAME),
+                "contract_id": MetadataValue.text(
+                    ORDER_CONTRACT["contract_id"]
+                ),
+                "contract_version": MetadataValue.text(
+                    ORDER_CONTRACT["version"]
+                ),
+                "contract_status": MetadataValue.text(
+                    ORDER_CONTRACT["status"]
+                ),
+                "owner_team": MetadataValue.text(
+                    ORDER_CONTRACT["owner_team"]
+                ),
+                "owner_contact": MetadataValue.text(
+                    ORDER_CONTRACT["owner_contact"]
+                ),
+                "producer_team": MetadataValue.text(
+                    ORDER_CONTRACT["producer_team"]
+                ),
+                "producer_contact": MetadataValue.text(
+                    ORDER_CONTRACT["producer_contact"]
+                ),
+                "compatibility": MetadataValue.text(compatibility),
+                "warnings": MetadataValue.json(warnings),
+                "alert_channels": MetadataValue.json(
+                    ORDER_CONTRACT["alert_channels"]
+                ),
+                "validated_columns": MetadataValue.json(
+                    sorted(actual_schema.keys())
+                ),
             }
         )
 
         return {
             "status": "passed",
+            "contract_id": ORDER_CONTRACT["contract_id"],
+            "contract_version": ORDER_CONTRACT["version"],
             "columns_validated": len(actual_schema),
+            "warnings": len(warnings),
         }
 
-    except pymysql.Error as e:
-        context.log.error(f"❌ Không thể kết nối MySQL Source: {e}")
+    except pymysql.Error as exc:
+        context.log.error(
+            "❌ Không thể kết nối MySQL Source để validate contract: %s",
+            exc,
+        )
         raise
 
     finally:

@@ -11,7 +11,7 @@
 | 1.0 | Initial version | Architecture gốc với Atomic Swap, Data Contract, Control Plane / Data Plane separation |
 | 1.1 | Current | Bổ sung concurrency control, run-scoped staging, orphan cleanup, advisory lock, backup retention |
 | 1.2 | Current | Bổ sung healthcheck strategy: functional DB healthcheck, webserver readiness, daemon heartbeat healthcheck, metadata DB healthcheck và phân biệt container/service/data product health |
-
+| 1.3 | 08/2026 | Nâng cấp Data Contract thành Internal Product: Bổ sung Contract Registry, Versioning, Ownership, Compatibility Policy và Governance Job. |
 ---
 
 ## 1. Executive Summary (Tóm tắt điều hành)
@@ -96,9 +96,32 @@ COMMIT;
 
 ### 3.2. Data Contracts & Schema Validation
 
-- **Vấn đề:** Source DB thay đổi schema ngầm (Silent Failure) làm hỏng pipeline downstream.
-- **Giải pháp:** Đặt một **Contract Validator** ở đầu pipeline. Nó so sánh schema thực tế của Source với bản Contract đã thỏa thuận.
-- **Hành vi khi vi phạm:** **FAIL-FAST**. Dừng toàn bộ pipeline, gửi Alert, không cho phép bất kỳ dữ liệu nào đi vào Staging.
+Vấn đề: 
+- Source DB thay đổi schema ngầm (Silent Failure) làm hỏng pipeline downstream.
+- Schema validation đơn thuần không trả lời được câu hỏi: "Ai sở hữu dữ liệu? Ai cần được báo khi schema đổi? Thay đổi nào được phép, thay đổi nào phải chặn?"
+
+Giải pháp: 
+Data Contract được thiết kế như một **Sản phẩm nội bộ (Internal Product)** có vòng đời và chính sách quản trị.
+
+1. **Contract Metadata & Ownership**:
+   Mỗi contract (`user_code/contracts/order_contract.py`) bắt buộc phải có:
+   - `contract_id` & `version` (Semantic Versioning).
+   - `owner_team` & `producer_team` (Trách nhiệm giải trình).
+   - `consumers` (Ai đang dùng dữ liệu này và SLA của họ là gì).
+   - `alert_channels` (Kênh nhận cảnh báo khi vi phạm).
+
+2. **Compatibility Policy (Chính sách tương thích)**:
+   Hệ thống phân loại rõ ràng các thay đổi schema:
+   - **Non-breaking (Additive)**: Thêm cột, mở rộng `varchar`, tăng `decimal` precision. -> *Hành vi: Pipeline pass, sinh Warning.*
+   - **Breaking**: Xóa cột bắt buộc, đổi kiểu dữ liệu, giảm kích thước. -> *Hành vi: FAIL-FAST, chặn dữ liệu bẩn.*
+
+3. **Contract Registry & Governance**:
+   - `user_code/contracts/registry.py` đóng vai trò là catalog tập trung.
+   - Asset `contract_registry` trong Dagster tự động validate tính hợp lệ của toàn bộ registry (đủ metadata, không trùng lặp ID) ở tầng Control Plane.
+   - Job `contract_governance_job` cho phép Platform Team kiểm tra sức khỏe của tầng governance độc lập với luồng ETL.
+
+4. **Schema Validation (Fail-Fast)**:
+   Validator so sánh schema thực tế của Source với `expected_schema` trong Contract. Nếu vi phạm breaking policy, pipeline dừng ngay lập tức, bảo vệ `orders_production` khỏi Data Corruption.
 
 
 ### 3.3. Concurrency Control & State Ownership
@@ -438,6 +461,14 @@ SLO gợi ý cho metadata database:
 | Daemon heartbeat freshness | Daemon còn sống và dequeue run | > 2 phút không có heartbeat |
 | Orphan staging tables | Bảng staging còn tồn tại sau run thành công | > 0 |
 | Backup table count | Số bảng backup production | > 1 |
+
+SLI cho Data Governance & Contracts
+| SLI | Ý nghĩa | Ngưỡng cảnh báo |
+|---|---|---|
+| Contract Registry Valid | Registry có đủ metadata (owner, consumer, version) và không trùng ID | Fail khi validate (Asset `contract_registry` lỗi) |
+| Contract Violation Count | Số lần pipeline fail do breaking change từ Source | > 0 (Cần investigate ngay lập tức, vi phạm SLA phản hồi) |
+| Unknown Contracted Columns | Số cột mới xuất hiện ở Source nhưng chưa khai báo trong Contract | Tăng liên tục > 3 ngày (Source Team đang âm thầm thêm cột) |
+| Deprecated Columns Still Present | Cột đã đánh dấu deprecated nhưng vẫn còn ở Source | Vượt quá `deprecation_timeline_days` |
 
 ### 7.1. SLO / SLA Design
 

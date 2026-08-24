@@ -250,43 +250,52 @@ Lab này sử dụng healthcheck nâng cao hơn mức kiểm tra container còn 
 ---
 
 ## 📁 Cấu trúc thư mục
-
 ```text
 dataops-lab/
-├── README.md                       # File bạn đang đọc
-├── ARCHITECTURE.md                 # Tài liệu kiến trúc chi tiết
-├── docker-compose.yml              # Định nghĩa hạ tầng
-├── .env                            # Secrets (KHÔNG commit)
-├── .env.example                    # Mẫu để tạo .env
-├── .gitignore                      # Loại trừ files khỏi Git
-├── .dockerignore                   # Loại trừ files khỏi Docker image
-│
-├── seed_data/                      # Dữ liệu khởi tạo tự động
-│   ├── mysql_init.sql              # Tạo bảng + data mẫu cho MySQL
-│   └── postgres_init.sql           # Khởi tạo schema cho PostgreSQL
-│
-├── platform/                       # [PLATFORM TEAM] Hạ tầng & Cấu hình
-│   └── dagster/
-│       ├── Dockerfile              # Build Dagster image
-│       ├── requirements.txt        # Python dependencies
-│       ├── dagster.yaml            # Cấu hình Dagster Instance
-│       └── workspace.yaml          # Khai báo User Code location
-│       └── healthchecks/
-│           ├── webserver_healthcheck.py
-│           ├── daemon_healthcheck.py
-│           └── data_plane_healthcheck.py
-└── user_code/                      # [DATA TEAM] Logic nghiệp vụ dữ liệu
-    ├── __init__.py
-    ├── definitions.py              # Entry point: Tổng hợp tất cả Assets
-    │
-    ├── contracts/                  # Data Contracts
-    │   ├── __init__.py
-    │   └── order_contract.py       # Schema kỳ vọng cho bảng orders
-    │
-    └── assets/                     # Data Assets (Pipeline logic)
-        ├── __init__.py
-        └── orders.py               # MySQL -> Staging -> Production
-```
+ ├── README.md                       # Tài liệu dành cho người dùng (Data Eng, Analyst)
+ ├── ARCHITECTURE.md                 # Tài liệu kiến trúc dành cho Platform/SRE
+ ├── CODEOWNERS                      # Quy định ownership và review policy (Git)
+ ├── docker-compose.yml              # Định nghĩa hạ tầng
+ ├── .env / .env.example             # Secrets (KHÔNG commit)
+ ├── .gitignore / .dockerignore      # Loại trừ files khỏi Git / Docker image
+ │
+ ├── docs/                           # Tài liệu nghiệp vụ & quy trình
+ │   ├── contracts/
+ │   │   └── orders.md               # 📄 Bản hợp đồng dữ liệu (dành cho con người đọc)
+ │   ├── processes/
+ │   │   └── data-contract-change-process.md # 📋 Quy trình thay đổi contract
+ │   └── reliability/
+ │       └── mini-prr-orders-pipeline.md
+ │
+ ├── seed_data/                      # Dữ liệu khởi tạo tự động
+ │   ├── mysql_init.sql
+ │   └── postgres_init.sql
+ │
+ ├── platform/                       # [PLATFORM TEAM] Hạ tầng & Cấu hình
+ │   └── dagster/
+ │       ├── Dockerfile
+ │       ├── requirements.txt
+ │       ├── dagster.yaml
+ │       ├── workspace.yaml
+ │       └── healthchecks/
+ │
+ ├── tests/                          # Automated Tests
+ │   └── contracts/
+ │       └── test_order_contract.py  # Unit test cho Data Contract
+ │
+ └── user_code/                      # [DATA TEAM] Logic nghiệp vụ dữ liệu
+     ├── __init__.py
+     ├── definitions.py              # Entry point: Tổng hợp Assets & Jobs
+     │
+     ├── contracts/                  # Data Contracts (Internal Products)
+     │   ├── __init__.py
+     │   ├── order_contract.py       # Định nghĩa Contract (Metadata, Policy, Schema)
+     │   └── registry.py             # Contract Registry (Danh mục hợp đồng)
+     │
+     └── assets/                     # Data Assets (Pipeline logic)
+         ├── __init__.py
+         ├── orders.py               # MySQL -> Staging -> Production
+         └── contract_registry.py    # Asset kiểm tra tính hợp lệ của Registry
 
 **Quy tắc:**
 
@@ -380,14 +389,27 @@ docker compose up --build -d
 
 ### 📋 Thay đổi Data Contract
 
-Khi Source Database thay đổi schema, bạn **BẮT BUỘC** phải cập nhật Data Contract trước.
+Data Contract trong hệ thống này không chỉ là một file cấu hình kỹ thuật, mà là một **Sản phẩm nội bộ** có Owner, Consumer, Version và Chính sách tương thích (Compatibility Policy).
 
-1. Mở file `user_code/contracts/order_contract.py`
-2. Cập nhật `EXPECTED_ORDERS_SCHEMA` và `REQUIRED_COLUMNS` để phản ánh schema mới.
-3. Build lại và chạy pipeline để kiểm tra.
+Khi Source Database (MySQL) thay đổi schema, quy trình bắt buộc như sau:
 
-> ⚠️ **CẢNH BÁO:** Không bao giờ thay đổi schema Source mà không cập nhật Data Contract. Pipeline sẽ FAIL-FAST và chặn toàn bộ dữ liệu bẩn vào Production. Đây là hành vi có chủ đích, không phải bug.
+1. **Phân loại thay đổi**:
+   - **Non-breaking (Additive)**: Thêm cột mới, tăng độ dài `varchar`, tăng `decimal` precision (giữ nguyên scale). Pipeline sẽ vẫn chạy nhưng có thể xuất hiện Warning.
+   - **Breaking**: Xóa cột bắt buộc, đổi tên cột, đổi kiểu dữ liệu không tương thích, giảm độ dài `varchar`. Pipeline sẽ **FAIL-FAST** ngay lập tức.
 
+2. **Quy trình cập nhật**:
+   - Đọc chi tiết quy trình tại: `docs/processes/data-contract-change-process.md`
+   - Cập nhật định nghĩa trong `user_code/contracts/order_contract.py`.
+   - Bump version contract (Semantic Versioning).
+   - Cập nhật tài liệu dành cho con người tại `docs/contracts/orders.md`.
+   - Đảm bảo `tests/contracts/test_order_contract.py` pass.
+   - Mở Pull Request và yêu cầu review từ các bên liên quan (theo `CODEOWNERS`).
+
+3. **Chạy kiểm tra Governance**:
+   - Trong Dagster UI, chạy job `contract_governance_job` (hoặc asset `contract_registry`) để đảm bảo registry không bị lỗi metadata.
+   - Build lại image và chạy pipeline để kiểm chứng.
+
+> ⚠️ **CẢNH BÁO**: Không bao giờ thay đổi schema Source mà không thông báo và cập nhật Data Contract. Hệ thống được thiết kế để **Fail-Fast over Silent Corruption**. Việc pipeline chặn dữ liệu bẩn là hành vi có chủ đích để bảo vệ Data Analysts và CEO.
 ---
 
 ## 🗄️ Quản lý dữ liệu
@@ -696,6 +718,23 @@ Cách xử lý:
 - Nếu log cho thấy lỗi authentication, role không tồn tại hoặc database không tồn tại, khả năng cao volume cũ không khớp với credentials hiện tại.
 - Trong lab, có thể reset volume để khởi tạo lại từ đầu. Trong môi trường có dữ liệu quan trọng, phải backup trước khi reset.
 
+
+### Lỗi: Contract registry validation failed
+**Hiện tượng**: Asset `contract_registry` hoặc job `contract_governance_job` bị fail.  
+**Nguyên nhân:** 
+- Contract thiếu các metadata bắt buộc (owner, consumer, version, policy...).
+- Registry bị trùng `contract_id`.
+- Khai báo registry không khớp với `contract_id` bên trong file contract.  
+**Giải pháp:**
+Đọc log chi tiết trong Dagster UI để biết field nào đang bị thiếu hoặc sai. Sửa lại `user_code/contracts/order_contract.py` hoặc `registry.py`.
+
+### Lỗi: DATA CONTRACT VIOLATION (Breaking Change)
+**Hiện tượng:** Pipeline fail ở step `validate_orders_schema`. Log hiển thị `❌ DATA CONTRACT VIOLATION!`.  
+**Nguyên nhân:** Source schema có thay đổi breaking (ví dụ: mất cột `amount`, đổi `varchar(50)` thành `varchar(20)`).  
+**Giải pháp:**
+1. Đọc log để biết chính xác cột và kiểu dữ liệu bị vi phạm.
+2. Liên hệ Source Team (Producer) để xác nhận xem đây là lỗi accident hay thay đổi có chủ đích.
+3. Nếu là thay đổi có chủ đích, thực hiện quy trình "Thay đổi Data Contract" để bump version và cập nhật policy.
 ---
 
 ## ❓ FAQ
@@ -782,6 +821,19 @@ Vì `.env` chỉ cung cấp giá trị cho Docker Compose interpolation. Biến 
 **Q: Khi nào cần reset volumes?**
 
 Khi volume cũ được khởi tạo với credentials khác, hoặc khi bạn muốn đưa lab về trạng thái seed data ban đầu. Reset volumes sẽ xóa dữ liệu hiện tại, chỉ nên dùng trong lab hoặc khi đã backup.
+  
+**Q: Data Contract khác gì với Schema Validation thông thường?**  
+
+Schema Validation chỉ là kỹ thuật (so khớp cột và kiểu dữ liệu). Data Contract là một thỏa thuận giữ
+
+
+**Q: Vì sao Source thêm cột mới mà Pipeline chỉ Warning chứ không Fail?**  
+
+Hệ thống tuân theo policy `backward_compatible_additive_only`. Việc Source thêm cột mới không làm hỏng logic ETL hiện tại. Tuy nhiên, Warning được sinh ra để nhắc nhở Data Engineer cập nhật Contract nếu cột mới đó cần được đưa vào Production.
+
+**Q: Ai là người sở hữu (Owner) Data Contract?**  
+ 
+Contract là tài sản chung. Source Team sở hữu dữ liệu gốc, Platform Team sở hữu hạ tầng thực thi, và Data Engineering / Business sở hữu logic tiêu thụ. Mọi thay đổi breaking đều cần sự đồng thuận (thể hiện qua quy trình Review trong `CODEOWNERS`).
 
 ---
 

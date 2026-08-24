@@ -1,0 +1,13 @@
+# Data Contracts là sản phẩm chung của Platform và Data Engineering.
+# Không cho phép sửa contract mà không có review.
+
+/user_code/contracts/ @platform-team @data-eng-lead
+/docs/contracts/ @platform-team @data-eng-lead
+/docs/processes/data-contract-change-process.md @platform-team @data-eng-lead
+
+# Orders pipeline logic thuộc Data Team, nhưng vẫn cần Data Eng Lead review.
+/user_code/assets/orders.py @data-eng-lead
+
+# Platform configuration chỉ Platform Team được sửa.
+/platform/dagster/ @platform-team
+/docker-compose.yml @platform-team
