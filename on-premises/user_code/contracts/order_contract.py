@@ -384,8 +384,29 @@ def validate_contract_definition(contract: Dict[str, Any]) -> List[str]:
     # -------------------------------------------------------------
     # Required fields
     # -------------------------------------------------------------
+    # Phân biệt rõ hai loại lỗi:
+    # 1. Field hoàn toàn không tồn tại trong contract.
+    # 2. Field tồn tại nhưng rỗng.
+    #
+    # Một số field bắt buộc phải khai báo, nhưng được phép rỗng.
+    # Ví dụ:
+    #   deprecated_columns = []
+    # nghĩa là chưa có cột nào bị deprecated. Đây là trạng thái hợp lệ.
+    # -------------------------------------------------------------
     for field in CONTRACT_REQUIRED_FIELDS:
-        value = contract.get(field)
+        if field not in contract:
+            errors.append(f"Contract missing required field: {field}")
+            continue
+
+        value = contract[field]
+
+        # deprecated_columns là field lifecycle bắt buộc phải khai báo,
+        # nhưng danh sách rỗng là hợp lệ.
+        if field == "deprecated_columns":
+            if value is None or not isinstance(value, list):
+                errors.append("Contract deprecated_columns must be a list.")
+            continue
+
         if value is None or value == "" or value == [] or value == {}:
             errors.append(f"Contract missing required field: {field}")
 
