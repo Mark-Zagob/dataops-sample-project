@@ -1,0 +1,222 @@
+# ============================================================================
+# DOCKER COMPOSE OVERLAY: MONITORING STACK
+# ============================================================================
+# Mục tiêu:
+# - Thêm Observability cho DataOps Labs mà không phá vỡ compose chính.
+# - Chạy bằng:
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# Production-grade principles:
+# - Monitoring phải tách khỏi Data Plane nhưng vẫn quan sát được Data Plane.
+# - Exporters dùng user least privilege, không dùng admin credentials.
+# - Không expose port không cần thiết ra ngoài trong production thật.
+# ============================================================================
+
+networks:
+  # Dùng chung network với hệ thống chính để scrape service discovery.
+  dataops-network:
+    driver: bridge
+
+volumes:
+  # Metrics retention cần disk. Đặt volume riêng để không mất dữ liệu khi restart.
+  prometheus_data:
+    driver: local
+
+  # Grafana lưu dashboard, user, datasource settings.
+  grafana_data:
+    driver: local
+
+  # Alertmanager lưu trạng thái silence / notification state.
+  alertmanager_data:
+    driver: local
+
+services:
+
+  # --------------------------------------------------------------------------
+  # 1. PROMETHEUS - Metrics database + alert evaluation engine
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: dataops-prometheus
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      # Config file được mount từ host để dễ version hóa.
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Nơi lưu TSDB.
+      - --storage.tsdb.path=/prometheus
+      # Lab có SSD 150GB, giữ 15 ngày là hợp lý.
+      # Production thật cần tính toán retention theo SLO và compliance.
+      - --storage.tsdb.retention.time=15d
+      # Bật lifecycle API để reload config không cần restart.
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      # Lab only. Production nên chặn port này hoặc đặt sau SSO/reverse proxy.
+      - "9090:9090"
+
+  # --------------------------------------------------------------------------
+  # 2. ALERTMANAGER - Alert routing, grouping, silencing
+  # --------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: dataops-alertmanager
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      # Lab only.
+      - "9093:9093"
+    # Giúp Alertmanager có thể gọi webhook trên host nếu cần test local receiver.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # --------------------------------------------------------------------------
+  # 3. GRAFANA - Visualization / Internal Product Interface
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: dataops-grafana
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    environment:
+      # Production-grade: không dùng anonymous access cho hệ thống có dữ liệu vận hành.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change_me_grafana_admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Provisioning as code: datasource và dashboard được quản lý bằng file.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      # Dùng 3001 để tránh conflict với Dagster UI port 3000.
+      - "3001:3000"
+
+  # --------------------------------------------------------------------------
+  # 4. NODE EXPORTER - Host metrics
+  # --------------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: dataops-node-exporter
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      # Đọc filesystem của host từ /host.
+      # Mục tiêu: đo CPU/memory/disk thật của VM, không chỉ của container.
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      # Tránh scrape các filesystem ảo không có giá trị.
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    ports:
+      # Lab only. Trong production có thể không cần expose.
+      - "9100:9100"
+
+  # --------------------------------------------------------------------------
+  # 5. CADVISOR - Container metrics
+  # --------------------------------------------------------------------------
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: dataops-cadvisor
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    privileged: true
+    command:
+      # Chỉ cần Docker metrics cho lab này.
+      - -docker_only=true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    ports:
+      # Lab only. Dùng 8081 để tránh conflict với các app khác.
+      - "8081:8080"
+
+  # --------------------------------------------------------------------------
+  # 6. MYSQL EXPORTER - Source DB observability
+  # --------------------------------------------------------------------------
+  mysqld-exporter-source:
+    image: prom/mysqld-exporter:v0.15.1
+    container_name: dataops-mysqld-exporter-source
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      # Exporter kết nối tới MySQL Source bằng service DNS của Docker network.
+      - --mysqld.address=mysql-source:3306
+      # Least privilege: dùng user monitoring riêng, không dùng datauser/root.
+      - --mysqld.username=monitoring
+    environment:
+      # Mật khẩu được truyền qua biến môi trường để không hardcode.
+      MYSQLD_EXPORTER_PASSWORD: ${MONITORING_MYSQL_PASSWORD:-change_me_mysql_monitoring}
+    depends_on:
+      mysql-source:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # 7. POSTGRES EXPORTER - Target Data Plane observability
+  # --------------------------------------------------------------------------
+  postgres-exporter-target:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: dataops-postgres-exporter-target
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      # Nạp custom queries để đo Data Product, không chỉ DB health.
+      - --extend.query-path=/etc/postgres_exporter/queries.yaml
+    environment:
+      # Production-grade note:
+      # - Dùng monitoring user.
+      # - sslmode=disable chỉ phù hợp lab nội bộ.
+      # - Production thật nên có TLS hoặc network encryption.
+      DATA_SOURCE_NAME: "postgresql://monitoring:${MONITORING_POSTGRES_TARGET_PASSWORD:-change_me_pg_target_monitoring}@postgres-target:5432/analytics_dwh?sslmode=disable"
+    volumes:
+      - ./monitoring/postgres-exporter/target-queries.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      postgres-target:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # 8. POSTGRES EXPORTER - Dagster Control Plane metadata observability
+  # --------------------------------------------------------------------------
+  postgres-exporter-metadata:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: dataops-postgres-exporter-metadata
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      - --extend.query-path=/etc/postgres_exporter/queries.yaml
+    environment:
+      # Control Plane metadata là trạng thái sống còn của Dagster.
+      # Nếu DB này down, run mới có thể không được dequeue.
+      DATA_SOURCE_NAME: "postgresql://monitoring:${MONITORING_POSTGRES_METADATA_PASSWORD:-change_me_pg_metadata_monitoring}@dagster-metadata:5432/dagster_metadata?sslmode=disable"
+    volumes:
+      - ./monitoring/postgres-exporter/metadata-queries.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      dagster-metadata:
+        condition: service_healthy

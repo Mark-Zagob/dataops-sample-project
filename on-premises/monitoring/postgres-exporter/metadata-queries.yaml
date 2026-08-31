@@ -1,0 +1,25 @@
+# ============================================================================
+# POSTGRES EXPORTER CUSTOM QUERIES - DAGSTER METADATA / CONTROL PLANE
+# ============================================================================
+# Mục tiêu:
+# - Đo sức khỏe Control Plane của Dagster.
+# - Phát hiện daemon stale.
+# - Phát hiện split-brain.
+#
+# SRE note:
+# - Metadata DB down khác với Data Plane corruption.
+# - Daemon stale có thể làm run queued vô thời hạn.
+# ============================================================================
+
+daemon_health:
+  query: |
+    SELECT
+      monitoring.daemon_heartbeat_age_seconds() AS heartbeat_age_seconds,
+      monitoring.active_daemon_count(120) AS active_daemon_count
+  metrics:
+    - heartbeat_age_seconds:
+        usage: "GAUGE"
+        description: "Age in seconds of latest RUN_COORDINATOR daemon heartbeat"
+    - active_daemon_count:
+        usage: "GAUGE"
+        description: "Number of active daemon heartbeats within freshness window"

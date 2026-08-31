@@ -1,0 +1,62 @@
+# ============================================================================
+# POSTGRES EXPORTER CUSTOM QUERIES - TARGET DATA PLANE
+# ============================================================================
+# Mục tiêu:
+# - Biến orders_production thành một observable data product.
+# - Không để scrape crash nếu bảng chưa tồn tại.
+# - Gom query nặng vào functions để dễ kiểm soát và comment SRE rõ ràng.
+#
+# Production note:
+# - orders_quality có thể rất nặng với bảng lớn.
+# - Trong production thật, nên thay bằng pipeline-emitted metrics.
+# ============================================================================
+
+orders_health:
+  query: |
+    SELECT
+      monitoring.orders_production_exists() AS production_exists,
+      (
+        SELECT COUNT(*)
+        FROM pg_catalog.pg_tables
+        WHERE schemaname = 'public'
+          AND tablename = 'orders_production_backup'
+      ) AS backup_count,
+      (
+        SELECT COUNT(*)
+        FROM pg_catalog.pg_tables
+        WHERE schemaname = 'public'
+          AND tablename LIKE 'orders_stg_%'
+      ) AS staging_orphan_count,
+      monitoring.orders_data_age_hours() AS data_age_hours,
+      monitoring.orders_row_count() AS row_count
+  metrics:
+    - production_exists:
+        usage: "GAUGE"
+        description: "1 if orders_production exists, 0 otherwise"
+    - backup_count:
+        usage: "GAUGE"
+        description: "Number of orders_production_backup tables"
+    - staging_orphan_count:
+        usage: "GAUGE"
+        description: "Number of run-scoped staging tables currently present"
+    - data_age_hours:
+        usage: "GAUGE"
+        description: "Business data age in hours based on MAX(created_at)"
+    - row_count:
+        usage: "GAUGE"
+        description: "Row count of orders_production. Heavy for large tables."
+
+orders_quality:
+  query: |
+    SELECT *
+    FROM monitoring.orders_quality_counts()
+  metrics:
+    - null_count:
+        usage: "GAUGE"
+        description: "Rows with NULL in required columns"
+    - negative_amount_count:
+        usage: "GAUGE"
+        description: "Rows with negative amount"
+    - duplicate_order_id_groups:
+        usage: "GAUGE"
+        description: "Duplicate order_id groups"

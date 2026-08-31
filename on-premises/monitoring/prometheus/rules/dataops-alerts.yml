@@ -1,0 +1,199 @@
+# ============================================================================
+# DATAOPS ALERT RULES
+# ============================================================================
+# Nguyên tắc:
+# - Alert khi cần hành động, không alert mọi thứ.
+# - Ưu tiên alert theo symptom và impact.
+# - Critical cho các lỗi ảnh hưởng trực tiếp đến data product/control plane.
+# - Warning cho operational hygiene.
+# ============================================================================
+
+groups:
+
+  # --------------------------------------------------------------------------
+  # Infrastructure / Exporter health
+  # --------------------------------------------------------------------------
+  - name: dataops-infrastructure.rules
+    rules:
+
+      - alert: ExporterDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+          layer: infrastructure
+        annotations:
+          summary: "Exporter {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.job }}. Observability blind spot."
+
+      - alert: HostDiskSpaceLowWarning
+        expr: |
+          (
+            node_filesystem_avail_bytes{mountpoint=~"/|/host", fstype!~"tmpfs|overlay|squashfs"}
+            /
+            node_filesystem_size_bytes{mountpoint=~"/|/host", fstype!~"tmpfs|overlay|squashfs"}
+          ) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+          layer: infrastructure
+        annotations:
+          summary: "Host filesystem has less than 15% free space"
+          description: "Disk pressure can cause DB crash or Prometheus data loss."
+
+      - alert: HostDiskSpaceCritical
+        expr: |
+          (
+            node_filesystem_avail_bytes{mountpoint=~"/|/host", fstype!~"tmpfs|overlay|squashfs"}
+            /
+            node_filesystem_size_bytes{mountpoint=~"/|/host", fstype!~"tmpfs|overlay|squashfs"}
+          ) < 0.08
+        for: 5m
+        labels:
+          severity: critical
+          layer: infrastructure
+        annotations:
+          summary: "Host filesystem has less than 8% free space"
+          description: "Immediate action required. Database and monitoring may fail soon."
+
+  # --------------------------------------------------------------------------
+  # Control Plane / Dagster metadata
+  # --------------------------------------------------------------------------
+  - name: dataops-control-plane.rules
+    rules:
+
+      - alert: PostgresTargetDown
+        expr: pg_up{job="postgres-target"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          layer: data-plane
+        annotations:
+          summary: "PostgreSQL target is down or monitoring cannot authenticate"
+          description: "Atomic Swap and orders_production availability are at risk."
+
+      - alert: PostgresMetadataDown
+        expr: pg_up{job="postgres-metadata"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          layer: control-plane
+        annotations:
+          summary: "Dagster metadata PostgreSQL is down"
+          description: "Dagster UI and run dequeue may be impacted."
+
+      - alert: MySQLSourceDown
+        expr: mysql_up{job="mysqld-source"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          layer: source
+        annotations:
+          summary: "MySQL source is down or monitoring cannot authenticate"
+          description: "Pipeline cannot extract data from source."
+
+      - alert: DagsterDaemonHeartbeatStale
+        expr: daemon_health_heartbeat_age_seconds > 180
+        for: 2m
+        labels:
+          severity: critical
+          layer: control-plane
+        annotations:
+          summary: "Dagster daemon heartbeat is stale"
+          description: "Runs may stay QUEUED and schedules/sensors may not execute."
+
+      - alert: DagsterDaemonSplitBrain
+        expr: daemon_health_active_daemon_count > 1
+        for: 2m
+        labels:
+          severity: critical
+          layer: control-plane
+        annotations:
+          summary: "Possible Dagster daemon split-brain detected"
+          description: "More than one daemon heartbeat is active. Concurrency guarantees are at risk."
+
+  # --------------------------------------------------------------------------
+  # Data Product / orders_production
+  # --------------------------------------------------------------------------
+  - name: dataops-data-product.rules
+    rules:
+
+      - alert: OrdersProductionMissing
+        expr: orders_health_production_exists == 0
+        for: 10m
+        labels:
+          severity: warning
+          layer: data-product
+        annotations:
+          summary: "orders_production table does not exist"
+          description: "If first pipeline run has already happened, this is abnormal."
+
+      - alert: OrdersDataTooOldWarning
+        expr: orders_health_data_age_hours > 26
+        for: 10m
+        labels:
+          severity: warning
+          layer: data-product
+        annotations:
+          summary: "orders_production data is older than 26 hours"
+          description: "Business freshness threshold from contract is being exceeded."
+
+      - alert: OrdersDataTooOldCritical
+        expr: orders_health_data_age_hours > 28
+        for: 10m
+        labels:
+          severity: critical
+          layer: data-product
+        annotations:
+          summary: "orders_production data is critically stale"
+          description: "Executive dashboard may be misleading. Investigate pipeline/source."
+
+      - alert: OrdersQualityNullsDetected
+        expr: orders_quality_null_count > 0
+        for: 5m
+        labels:
+          severity: critical
+          layer: data-product
+        annotations:
+          summary: "NULL values detected in required order columns"
+          description: "Data product violates required fields contract."
+
+      - alert: OrdersQualityNegativeAmountDetected
+        expr: orders_quality_negative_amount_count > 0
+        for: 5m
+        labels:
+          severity: critical
+          layer: data-product
+        annotations:
+          summary: "Negative amount detected in orders_production"
+          description: "Business-invalid revenue data may corrupt analytics."
+
+      - alert: OrdersQualityDuplicatesDetected
+        expr: orders_quality_duplicate_order_id_groups > 0
+        for: 5m
+        labels:
+          severity: critical
+          layer: data-product
+        annotations:
+          summary: "Duplicate order_id groups detected"
+          description: "Primary key semantics are violated."
+
+      - alert: OrdersStagingOrphanDetected
+        expr: orders_health_staging_orphan_count > 0
+        for: 30m
+        labels:
+          severity: warning
+          layer: data-product
+        annotations:
+          summary: "Run-scoped staging tables still exist"
+          description: "If no run is active, this may indicate orphan staging."
+
+      - alert: OrdersBackupCountUnexpected
+        expr: orders_health_backup_count > 1
+        for: 10m
+        labels:
+          severity: warning
+          layer: data-product
+        annotations:
+          summary: "More than one production backup table detected"
+          description: "Backup retention should be one generation in current design."

@@ -1,0 +1,20 @@
+# ============================================================================
+# GRAFANA DASHBOARD PROVIDER
+# ============================================================================
+# Dashboard as code:
+# - Không phụ thuộc click tay trên UI.
+# - Có thể review bằng Git.
+# - Có thể rollback.
+# ============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: DataOps
+    folder: DataOps
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
