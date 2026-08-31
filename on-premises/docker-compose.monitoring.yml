@@ -36,7 +36,7 @@ services:
   # 1. PROMETHEUS - Metrics database + alert evaluation engine
   # --------------------------------------------------------------------------
   prometheus:
-    image: prom/prometheus:v2.53.0
+    image: prom/prometheus:v3.10.0
     container_name: dataops-prometheus
     restart: unless-stopped
     networks:
@@ -63,7 +63,7 @@ services:
   # 2. ALERTMANAGER - Alert routing, grouping, silencing
   # --------------------------------------------------------------------------
   alertmanager:
-    image: prom/alertmanager:v0.27.0
+    image: prom/alertmanager:v0.28.1
     container_name: dataops-alertmanager
     restart: unless-stopped
     networks:
@@ -85,7 +85,7 @@ services:
   # 3. GRAFANA - Visualization / Internal Product Interface
   # --------------------------------------------------------------------------
   grafana:
-    image: grafana/grafana:11.1.0
+    image: grafana/grafana:12.3.3
     container_name: dataops-grafana
     restart: unless-stopped
     networks:
@@ -109,7 +109,7 @@ services:
   # 4. NODE EXPORTER - Host metrics
   # --------------------------------------------------------------------------
   node-exporter:
-    image: prom/node-exporter:v1.8.1
+    image: prom/node-exporter:v1.10.2
     container_name: dataops-node-exporter
     restart: unless-stopped
     networks:
@@ -134,7 +134,7 @@ services:
   # 5. CADVISOR - Container metrics
   # --------------------------------------------------------------------------
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    image: gcr.io/cadvisor/cadvisor:v0.51.0
     container_name: dataops-cadvisor
     restart: unless-stopped
     networks:
@@ -159,7 +159,7 @@ services:
   # 6. MYSQL EXPORTER - Source DB observability
   # --------------------------------------------------------------------------
   mysqld-exporter-source:
-    image: prom/mysqld-exporter:v0.15.1
+    image: prom/mysqld-exporter:v0.16.0
     container_name: dataops-mysqld-exporter-source
     restart: unless-stopped
     networks:
@@ -180,7 +180,7 @@ services:
   # 7. POSTGRES EXPORTER - Target Data Plane observability
   # --------------------------------------------------------------------------
   postgres-exporter-target:
-    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
     container_name: dataops-postgres-exporter-target
     restart: unless-stopped
     networks:
@@ -204,7 +204,7 @@ services:
   # 8. POSTGRES EXPORTER - Dagster Control Plane metadata observability
   # --------------------------------------------------------------------------
   postgres-exporter-metadata:
-    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
     container_name: dataops-postgres-exporter-metadata
     restart: unless-stopped
     networks:

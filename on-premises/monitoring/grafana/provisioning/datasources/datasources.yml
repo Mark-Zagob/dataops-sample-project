@@ -1,44 +1,20 @@
 # ============================================================================
-# ALERTMANAGER CONFIGURATION
+# GRAFANA DATASOURCE PROVISIONING
 # ============================================================================
-# Mục tiêu:
-# - Group alert để tránh spam.
-# - Route critical và warning riêng.
-# - Cung cấp chỗ để gắn Slack/Email/PagerDuty sau này.
-#
-# Hiện tại:
-# - Dùng webhook placeholder.
-# - Bạn có thể thay bằng Slack receiver, email receiver hoặc PagerDuty.
+# Production-grade principle:
+# - Datasource được quản lý bằng file, không click tay.
+# - Có thể reproduce lại môi trường.
 # ============================================================================
 
-global:
-  resolve_timeout: 5m
+apiVersion: 1
 
-route:
-  receiver: default
-  group_by:
-    - alertname
-    - severity
-    - layer
-  group_wait: 30s
-  group_interval: 5m
-  repeat_interval: 4h
-  routes:
-    - matchers:
-        - severity="critical"
-      receiver: critical
-      repeat_interval: 1h
-
-receivers:
-  - name: default
-    webhook_configs:
-      # Thay bằng receiver thật của bạn.
-      # Nếu chưa có receiver, có thể comment webhook_configs và chỉ dùng Alertmanager UI.
-      - url: 'http://host.docker.internal:5001/'
-        send_resolved: true
-
-  - name: critical
-    webhook_configs:
-      # Critical route riêng để sau này gắn kênh on-call.
-      - url: 'http://host.docker.internal:5001/'
-        send_resolved: true
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 30s
