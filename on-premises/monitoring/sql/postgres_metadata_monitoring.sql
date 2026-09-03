@@ -184,16 +184,22 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA monitoring
     GRANT EXECUTE ON FUNCTIONS TO monitoring;
 
 -- ============================================================================
--- 6. NEW (v2): Drift Detector - phơi bày sự thật thô về mọi daemon_type
+-- 6. NEW (v3): Drift Detector - phơi bày sự thật thô về mọi daemon_type
 -- ============================================================================
--- [FIX v2 2026-09-03]
--- - Bỏ cast ::text thừa trong SELECT (phá vỡ expression-matching của GROUP BY).
---   LOWER(varchar) đã trả về text rồi, cast là redundant AND harmful.
--- - HARDENING: không nuốt lỗi im lặng nữa. GET STACKED DIAGNOSTICS lấy
---   MESSAGE_TEXT thật và nhét vào row => lần sau hỏng, dashboard/Prometheus
---   sẽ hiện "check_error: <lý do>" thay vì sentinel mù.
--- - left(v_err, 60): SRE cardinality discipline - KHÔNG được để error message
---   dài tùy ý chạy vào Prometheus label sau này (high-cardinality explosion).
+-- [FIX v3 2026-09-03]
+-- LỖI CỦA v2: "structure of query does not match function result type".
+-- Nguyên nhân:
+--   - LOWER(varchar) có thể trả về varchar, không phải text.
+--   - EXTRACT(EPOCH FROM ...) trả về numeric, không phải double precision.
+--   - Dynamic SQL không được type-check lúc CREATE FUNCTION, chỉ check runtime.
+--
+-- FIX: dùng subquery để tách 2 trách nhiệm:
+--   (1) Inner query: tính toán thô (group by, max, coalesce).
+--   (2) Outer query: cast tường minh sang đúng RETURNS TABLE signature.
+--
+-- SRE principle: "Explicit beats implicit in dynamic SQL."
+-- Pattern này hoạt động ổn định trên mọi PostgreSQL version (12+) và không
+-- phụ thuộc vào implicit cast policy thay đổi giữa các minor release.
 CREATE OR REPLACE FUNCTION monitoring.daemon_type_inventory()
 RETURNS TABLE (daemon_type text, heartbeat_age_seconds double precision)
 LANGUAGE plpgsql
@@ -207,16 +213,24 @@ BEGIN
         RETURN;
     END IF;
 
-    -- [FIX] SELECT và GROUP BY dùng CÙNG MỘT biểu thức LOWER(daemon_type).
+    -- [SRE] Subquery pattern: inner = computation, outer = type casting.
+    -- - GROUP BY dùng LOWER(daemon_type) (không cast) để grouping ổn định.
+    -- - Outer SELECT cast ::text và ::double precision để khớp RETURNS TABLE.
+    -- - left(v_err, 60) vẫn giữ discipline cardinality cho error message.
     RETURN QUERY EXECUTE '
-        SELECT LOWER(daemon_type) AS daemon_type,
-               COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX("timestamp"))), 999999)
-        FROM public.daemon_heartbeats
-        GROUP BY LOWER(daemon_type)
+        SELECT
+            inner_result.daemon_type::text,
+            inner_result.heartbeat_age_seconds::double precision
+        FROM (
+            SELECT LOWER(daemon_type) AS daemon_type,
+                   COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX("timestamp"))), 999999) AS heartbeat_age_seconds
+            FROM public.daemon_heartbeats
+            GROUP BY LOWER(daemon_type)
+        ) AS inner_result
     ';
 EXCEPTION WHEN others THEN
     GET STACKED DIAGNOSTICS v_err = MESSAGE_TEXT;
-    RETURN QUERY SELECT 'check_error: ' || left(v_err, 60), 999999::double precision;
+    RETURN QUERY SELECT ('check_error: ' || left(v_err, 60))::text, 999999::double precision;
 END;
 $$;
 
