@@ -13,11 +13,14 @@
 -- - Metadata DB là Control Plane state.
 -- - Nếu DB này unhealthy, pipeline có thể không dequeue run.
 -- - Tuy nhiên data đã swap vào orders_production không tự mất.
+--
+-- [INCIDENT FIX 2026-09-03]
+-- - Thêm IN-list version-tolerant cho 'RUN_COORDINATOR' / 'QUEUED_RUN_COORDINATOR'
+--   để tương thích Dagster 1.10.x.
+-- - Thêm drift detector function daemon_type_inventory().
 -- ============================================================================
 
--- ----------------------------------------------------------------------------
 -- 1. Tạo role monitoring idempotent
--- ----------------------------------------------------------------------------
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -25,29 +28,26 @@ BEGIN
         WHERE rolname = 'monitoring'
     ) THEN
         CREATE ROLE monitoring
-        LOGIN
-        PASSWORD '__MONITORING_POSTGRES_METADATA_PASSWORD__';
+            LOGIN
+            PASSWORD 'MONITORING_POSTGRES_METADATA_PASSWORD';
     ELSE
         ALTER ROLE monitoring
-        LOGIN
-        PASSWORD '__MONITORING_POSTGRES_METADATA_PASSWORD__';
+            LOGIN
+            PASSWORD 'MONITORING_POSTGRES_METADATA_PASSWORD';
     END IF;
 END
 $$;
 
--- ----------------------------------------------------------------------------
 -- 2. Tạo schema monitoring
--- ----------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS monitoring;
 
--- ----------------------------------------------------------------------------
--- 3. Function tính tuổi heartbeat của RUN_COORDINATOR daemon
--- ----------------------------------------------------------------------------
--- Hàm này xử lý cả hai khả năng:
--- - timestamp là kiểu timestamp/timestamptz
--- - timestamp là kiểu numeric epoch
---
--- Điều này quan trọng vì healthcheck hiện tại của bạn cũng phải xử lý đa schema.
+-- ============================================================================
+-- 3. Function tính tuổi heartbeat của Run Coordinator family
+-- ============================================================================
+-- [INCIDENT FIX 2026-09-03]
+-- Dagster 1.10.x ghi 'QUEUED_RUN_COORDINATOR', version cũ ghi 'RUN_COORDINATOR'.
+-- IN-list dưới đây tolerate cả hai. Khi có alias mới, THÊM vào IN-list
+-- ở đây VÀ ở function active_daemon_count() phần 4 (anchor comment).
 CREATE OR REPLACE FUNCTION monitoring.daemon_heartbeat_age_seconds()
 RETURNS double precision
 LANGUAGE plpgsql
@@ -55,35 +55,37 @@ STABLE
 AS $$
 DECLARE
     v_type text;
-    v_age double precision;
+    v_age  double precision;
 BEGIN
+    -- Defensive layer 1 (structural drift): bảng chưa tồn tại => sentinel.
     IF to_regclass('public.daemon_heartbeats') IS NULL THEN
         RETURN 999999;
     END IF;
 
-    SELECT data_type
-    INTO v_type
+    -- Defensive layer 2: cột timestamp có tồn tại và có type hợp lệ?
+    SELECT data_type INTO v_type
     FROM information_schema.columns
     WHERE table_schema = 'public'
-      AND table_name = 'daemon_heartbeats'
-      AND column_name = 'timestamp';
+      AND table_name   = 'daemon_heartbeats'
+      AND column_name  = 'timestamp';
 
     IF v_type IS NULL THEN
         RETURN 999999;
     END IF;
 
+    -- Defensive layer 3 (enum drift): IN-list các alias đã biết.
     IF v_type IN ('timestamp with time zone', 'timestamp without time zone') THEN
         EXECUTE '
             SELECT EXTRACT(EPOCH FROM (NOW() - MAX("timestamp")))
             FROM public.daemon_heartbeats
-            WHERE UPPER(daemon_type) = ''RUN_COORDINATOR''
+            WHERE UPPER(daemon_type) IN (''RUN_COORDINATOR'', ''QUEUED_RUN_COORDINATOR'')
         ' INTO v_age;
     ELSE
-        -- Giả định numeric epoch seconds.
+        -- Numeric epoch seconds (behavioral drift tolerance).
         EXECUTE '
             SELECT EXTRACT(EPOCH FROM NOW()) - MAX("timestamp")
             FROM public.daemon_heartbeats
-            WHERE UPPER(daemon_type) = ''RUN_COORDINATOR''
+            WHERE UPPER(daemon_type) IN (''RUN_COORDINATOR'', ''QUEUED_RUN_COORDINATOR'')
         ' INTO v_age;
     END IF;
 
@@ -93,11 +95,11 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
--- ----------------------------------------------------------------------------
--- 4. Function đếm số daemon active gần đây
--- ----------------------------------------------------------------------------
--- Dùng để phát hiện split-brain.
--- Nếu không có daemon_id, trả về 1 để không tạo alert giả.
+-- ============================================================================
+-- 4. Function đếm số daemon active gần đây (split-brain detection)
+-- ============================================================================
+-- [INCIDENT FIX 2026-09-03] - cùng root cause với phần 3.
+-- [ANCHOR] CÙNG IN-list với phần 3. Sửa 1 chỗ thì sửa cả 2.
 CREATE OR REPLACE FUNCTION monitoring.active_daemon_count(
     max_stale_seconds double precision DEFAULT 120
 )
@@ -106,11 +108,11 @@ LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
-    v_type text;
+    v_type          text;
     v_has_daemon_id boolean;
-    v_cutoff double precision;
-    v_sql text;
-    v_count integer;
+    v_cutoff        double precision;
+    v_sql           text;
+    v_count         integer;
 BEGIN
     IF to_regclass('public.daemon_heartbeats') IS NULL THEN
         RETURN 0;
@@ -120,21 +122,20 @@ BEGIN
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = 'public'
-          AND table_name = 'daemon_heartbeats'
-          AND column_name = 'daemon_id'
-    )
-    INTO v_has_daemon_id;
+          AND table_name   = 'daemon_heartbeats'
+          AND column_name  = 'daemon_id'
+    ) INTO v_has_daemon_id;
 
     IF NOT v_has_daemon_id THEN
+        -- Fail-safe: không vu oan split-brain nếu không có daemon_id column.
         RETURN 1;
     END IF;
 
-    SELECT data_type
-    INTO v_type
+    SELECT data_type INTO v_type
     FROM information_schema.columns
     WHERE table_schema = 'public'
-      AND table_name = 'daemon_heartbeats'
-      AND column_name = 'timestamp';
+      AND table_name   = 'daemon_heartbeats'
+      AND column_name  = 'timestamp';
 
     IF v_type IS NULL THEN
         RETURN 0;
@@ -146,43 +147,78 @@ BEGIN
         v_sql := format(
             'SELECT COUNT(DISTINCT daemon_id)
              FROM public.daemon_heartbeats
-             WHERE UPPER(daemon_type) = %L
+             WHERE UPPER(daemon_type) IN (''RUN_COORDINATOR'', ''QUEUED_RUN_COORDINATOR'')
                AND "timestamp" > TO_TIMESTAMP(%s)',
-            'RUN_COORDINATOR',
             v_cutoff
         );
     ELSE
         v_sql := format(
             'SELECT COUNT(DISTINCT daemon_id)
              FROM public.daemon_heartbeats
-             WHERE UPPER(daemon_type) = %L
+             WHERE UPPER(daemon_type) IN (''RUN_COORDINATOR'', ''QUEUED_RUN_COORDINATOR'')
                AND "timestamp" > %s',
-            'RUN_COORDINATOR',
             v_cutoff
         );
     END IF;
 
     EXECUTE v_sql INTO v_count;
-
     RETURN COALESCE(v_count, 0);
 EXCEPTION WHEN others THEN
     RETURN 0;
 END;
 $$;
 
--- ----------------------------------------------------------------------------
+-- ============================================================================
 -- 5. Grants cho monitoring role
--- ----------------------------------------------------------------------------
+-- ============================================================================
 GRANT USAGE ON SCHEMA public TO monitoring;
 GRANT USAGE ON SCHEMA monitoring TO monitoring;
-
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO monitoring;
 
--- Nếu Dagster tạo thêm bảng mới trong tương lai, monitoring vẫn đọc được.
+-- Để các bảng tương lai Dagster tạo ra cũng readable.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-GRANT SELECT ON TABLES TO monitoring;
+    GRANT SELECT ON TABLES TO monitoring;
 
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA monitoring TO monitoring;
-
 ALTER DEFAULT PRIVILEGES IN SCHEMA monitoring
-GRANT EXECUTE ON FUNCTIONS TO monitoring;
+    GRANT EXECUTE ON FUNCTIONS TO monitoring;
+
+-- ============================================================================
+-- 6. NEW (v2): Drift Detector - phơi bày sự thật thô về mọi daemon_type
+-- ============================================================================
+-- [FIX v2 2026-09-03]
+-- - Bỏ cast ::text thừa trong SELECT (phá vỡ expression-matching của GROUP BY).
+--   LOWER(varchar) đã trả về text rồi, cast là redundant AND harmful.
+-- - HARDENING: không nuốt lỗi im lặng nữa. GET STACKED DIAGNOSTICS lấy
+--   MESSAGE_TEXT thật và nhét vào row => lần sau hỏng, dashboard/Prometheus
+--   sẽ hiện "check_error: <lý do>" thay vì sentinel mù.
+-- - left(v_err, 60): SRE cardinality discipline - KHÔNG được để error message
+--   dài tùy ý chạy vào Prometheus label sau này (high-cardinality explosion).
+CREATE OR REPLACE FUNCTION monitoring.daemon_type_inventory()
+RETURNS TABLE (daemon_type text, heartbeat_age_seconds double precision)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_err text;
+BEGIN
+    IF to_regclass('public.daemon_heartbeats') IS NULL THEN
+        RETURN QUERY SELECT 'no_table'::text, 999999::double precision;
+        RETURN;
+    END IF;
+
+    -- [FIX] SELECT và GROUP BY dùng CÙNG MỘT biểu thức LOWER(daemon_type).
+    RETURN QUERY EXECUTE '
+        SELECT LOWER(daemon_type) AS daemon_type,
+               COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX("timestamp"))), 999999)
+        FROM public.daemon_heartbeats
+        GROUP BY LOWER(daemon_type)
+    ';
+EXCEPTION WHEN others THEN
+    GET STACKED DIAGNOSTICS v_err = MESSAGE_TEXT;
+    RETURN QUERY SELECT 'check_error: ' || left(v_err, 60), 999999::double precision;
+END;
+$$;
+
+-- Cấp quyền cho monitoring role đọc function mới
+GRANT EXECUTE ON FUNCTION monitoring.daemon_type_inventory() TO monitoring;

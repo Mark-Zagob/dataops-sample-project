@@ -128,7 +128,15 @@ def main() -> int:
                 timestamp_expression = timestamp_column
                 fresh_predicate = f"{timestamp_column} > %s"
 
-            daemon_type = "RUN_COORDINATOR"
+            # [SRE - INCIDENT FIX 2026-09-03]
+            # Dagster 1.10.x ghi heartbeat 'QUEUED_RUN_COORDINATOR'; version cũ
+            # ghi 'RUN_COORDINATOR'. Hardcode 1 giá trị => healthcheck fail vĩnh
+            # viễn (false positive) => container unhealthy dù daemon sống khỏe.
+            # [ANCHOR] Giữ ĐỒNG BỘ với IN-list trong
+            # monitoring/sql/postgres_metadata_monitoring.sql (phần 3 & 4).
+            coordinator_types = ("RUN_COORDINATOR", "QUEUED_RUN_COORDINATOR")
+            # Build IN-list động: thêm alias mới chỉ cần sửa tuple phía trên.
+            type_placeholders = ", ".join(["%s"] * len(coordinator_types))
 
             # -----------------------------------------------------
             # 3. Kiểm tra heartbeat mới nhất của RUN_COORDINATOR
@@ -137,9 +145,9 @@ def main() -> int:
                 f"""
                 SELECT MAX({timestamp_expression})
                 FROM daemon_heartbeats
-                WHERE UPPER(daemon_type) = %s
+                WHERE UPPER(daemon_type) IN ({type_placeholders})
                 """,
-                (daemon_type,),
+                coordinator_types,
             )
 
             latest_heartbeat = cursor.fetchone()[0]
@@ -147,7 +155,7 @@ def main() -> int:
             if latest_heartbeat is None:
                 eprint(
                     "Daemon healthcheck failed: "
-                    f"no heartbeat found for daemon_type={daemon_type}"
+                    f"no heartbeat found for coordinator types {coordinator_types}"
                 )
                 return 1
 
@@ -156,7 +164,7 @@ def main() -> int:
             if age_seconds > max_stale_seconds:
                 eprint(
                     "Daemon healthcheck failed: "
-                    f"{daemon_type} heartbeat is stale. "
+                    f"{coordinator_types} heartbeat is stale. "
                     f"age_seconds={age_seconds:.1f}, "
                     f"max_stale_seconds={max_stale_seconds}"
                 )
@@ -168,14 +176,16 @@ def main() -> int:
             if "daemon_id" in columns:
                 cutoff_epoch = time.time() - max_stale_seconds
 
+                # [SRE] Thứ tự params: IN-list trước, cutoff của fresh_predicate sau.
+                # Sai thứ tự params là lớp lỗi kinh điển của parameterized query.
                 cursor.execute(
                     f"""
                     SELECT COUNT(DISTINCT daemon_id)
                     FROM daemon_heartbeats
-                    WHERE UPPER(daemon_type) = %s
-                      AND {fresh_predicate}
+                    WHERE UPPER(daemon_type) IN ({type_placeholders})
+                    AND {fresh_predicate}
                     """,
-                    (daemon_type, cutoff_epoch),
+                    coordinator_types + (cutoff_epoch,),
                 )
 
                 active_daemon_count = cursor.fetchone()[0]
@@ -184,13 +194,13 @@ def main() -> int:
                     eprint(
                         "Daemon healthcheck failed: possible split-brain. "
                         f"active_daemon_count={active_daemon_count} "
-                        f"for daemon_type={daemon_type}"
+                        f"for daemon_type={coordinator_types}"
                     )
                     return 1
 
         print(
             "Daemon healthcheck passed: "
-            "metadata DB OK, RUN_COORDINATOR heartbeat fresh"
+            "metadata DB OK, run-coordinator heartbeat fresh"
         )
         return 0
 
