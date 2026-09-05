@@ -106,6 +106,7 @@ services:
 
     volumes:
       - dagster_metadata_data:/var/lib/postgresql/data
+      - ./monitoring/sql/postgres_metadata_monitoring.sql:/docker-entrypoint-initdb.d/01_monitoring.sql:ro
 
     healthcheck:
       test:
