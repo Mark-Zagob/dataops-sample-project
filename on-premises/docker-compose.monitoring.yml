@@ -30,6 +30,12 @@ volumes:
   alertmanager_data:
     driver: local
 
+  # Pushgateway lưu ephemeral metrics từ pipeline runs.
+  # Không cần volume riêng vì metrics có thể tái tạo từ lần chạy sau.
+  # Tuy nhiên, vẫn dùng tmpfs để tránh ghi disk không cần thiết.
+  pushgateway_data:
+    driver: local
+
 services:
 
   # --------------------------------------------------------------------------
@@ -199,6 +205,45 @@ services:
     depends_on:
       postgres-target:
         condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # 9. PROMETHEUS PUSHGATEWAY - Ephemeral metrics receiver
+  # --------------------------------------------------------------------------
+  # ARCHITECTURE RATIONALE:
+  # - Pipeline (Dagster) KHÔNG expose /metrics endpoint vì:
+  #   + Pipeline là batch job, chạy xong rồi tắt → Prometheus không scrape được
+  #   + Nếu expose endpoint, phải giữ process alive → waste resource
+  # - Thay vào đó, pipeline PUSH metrics lên Pushgateway sau khi chạy xong
+  # - Prometheus kéo metric từ Pushgateway (Pull model vẫn giữ)
+  #
+  # BLAST RADIUS:
+  # - Nếu Pushgateway down: Pipeline vẫn chạy xong, chỉ mất metric tạm thời
+  # - Data Plane (DB production) HOÀN TOÀN KHÔNG BỊ ẢNH HƯỞNG
+  # - Đây là "decoupled observability" - monitoring là side-effect, không phải dependency
+  #
+  # STALE METRICS HANDLING:
+  # - Pushgateway giữ metric cho đến khi bị overwrite bởi push mới
+  # - Dùng `--persistence.file` để lưu metrics qua restart (optional cho lab)
+  # - Trong production, có thể dùng `--persistence.interval` để backup
+  pushgateway:
+    image: prom/pushgateway:v1.11.1
+    container_name: dataops-pushgateway
+    restart: unless-stopped
+    networks:
+      - dataops-network
+    command:
+      # Bật lifecycle API để quản lý metrics (DELETE, reset)
+      - --web.enable-lifecycle
+      # Persistence: lưu metrics xuống file để không mất khi restart
+      # File này được mount vào volume để survive container restart
+      - --persistence.file=/data/pushgateway_metrics.txt
+      # Flush interval: ghi file mỗi 5 phút (tránh ghi disk liên tục)
+      - --persistence.interval=5m
+    volumes:
+      - pushgateway_data:/data
+    ports:
+      # Lab only. Production nên chặn port này hoặc đặt sau SSO/reverse proxy
+      - "9091:9091"
 
   # --------------------------------------------------------------------------
   # 8. POSTGRES EXPORTER - Dagster Control Plane metadata observability

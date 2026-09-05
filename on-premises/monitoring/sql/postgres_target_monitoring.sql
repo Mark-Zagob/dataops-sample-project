@@ -1,18 +1,31 @@
 -- ============================================================================
--- POSTGRES TARGET MONITORING SETUP
+-- POSTGRES TARGET MONITORING SETUP (LIGHTWEIGHT ONLY)
 -- ============================================================================
 -- Database: analytics_dwh
 --
 -- Mục tiêu:
 -- - Tạo monitoring role least privilege.
 -- - Tạo các function giúp postgres_exporter scrape an toàn.
--- - Tránh lỗi scrape khi orders_production chưa tồn tại.
--- - Tránh query trực tiếp quá mạnh trong scrape config.
+-- - CHỈ giữ lại lightweight functions (không query data rows).
+-- - Data quality, row count, data age giờ do PIPELINE EMIT qua Pushgateway.
+--
+-- ARCHITECTURE CHANGE (Phase 1 - SRE Optimization):
+-- - TRƯỚC: postgres_exporter gọi function nặng (COUNT(*), MAX(created_at))
+--   → Noisy Neighbor, giết DB production khi scale
+-- - SAU: Pipeline tự tính metric → Push lên Pushgateway
+--   → Data Plane KHÔNG BỊ CHẠM bởi monitoring
+--
+-- FUNCTIONS GIỮ LẠI (lightweight):
+-- - orders_production_exists(): query pg_catalog, không scan data
+--
+-- FUNCTIONS ĐÃ XÓA (chuyển sang pipeline-emitted):
+-- - orders_data_age_hours(): pipeline tự tính từ MAX(created_at)
+-- - orders_row_count(): pipeline tự đếm khi load staging
+-- - orders_quality_counts(): pipeline tự check trên staging trước khi swap
 --
 -- Production note:
--- - Các query COUNT(*) / duplicate / NULL có thể rất nặng với bảng lớn.
--- - Trong production thật, nên ưu tiên pipeline-emitted metrics.
--- - Lab này chấp nhận query trực tiếp vì dữ liệu nhỏ.
+-- - File này giờ chỉ chứa metadata functions
+-- - Nếu cần debug data quality, query trực tiếp DB (không qua exporter)
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
@@ -42,11 +55,16 @@ $$;
 CREATE SCHEMA IF NOT EXISTS monitoring;
 
 -- ----------------------------------------------------------------------------
--- 3. Function kiểm tra orders_production có tồn tại không
+-- 3. Function kiểm tra orders_production có tồn tại không (LIGHTWEIGHT)
 -- ----------------------------------------------------------------------------
 -- SRE reasoning:
 -- Monitoring không được fail chỉ vì production table chưa tồn tại.
 -- Thay vào đó trả về 0 để Prometheus có metric và alert phù hợp.
+--
+-- WHY LIGHTWEIGHT?
+-- - Dùng to_regclass() → query system catalog
+-- - KHÔNG scan data rows
+-- - Trả về ngay lập tức
 CREATE OR REPLACE FUNCTION monitoring.orders_production_exists()
 RETURNS integer
 LANGUAGE plpgsql
@@ -61,126 +79,11 @@ END;
 $$;
 
 -- ----------------------------------------------------------------------------
--- 4. Function tính business data age theo MAX(created_at)
--- ----------------------------------------------------------------------------
--- Contract hiện tại định nghĩa freshness dựa trên tuổi của dữ liệu mới nhất.
--- Trả về 9999 nếu không xác định được, để alert có thể bắt được trạng thái xấu.
-CREATE OR REPLACE FUNCTION monitoring.orders_data_age_hours()
-RETURNS double precision
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    age_hours double precision;
-BEGIN
-    IF to_regclass('public.orders_production') IS NULL THEN
-        RETURN 9999;
-    END IF;
-
-    EXECUTE '
-        SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) / 3600.0
-        FROM public.orders_production
-    ' INTO age_hours;
-
-    RETURN COALESCE(age_hours, 9999);
-EXCEPTION WHEN others THEN
-    -- Nếu schema đổi bất thường hoặc lỗi query, trả về giá trị rất lớn.
-    -- Không để exporter crash.
-    RETURN 9999;
-END;
-$$;
-
--- ----------------------------------------------------------------------------
--- 5. Function đếm row count
--- ----------------------------------------------------------------------------
--- Production warning:
--- COUNT(*) trên bảng lớn có thể gây tải. Trong production thật, hãy cân nhắc:
--- - pg_class.reltuples nếu chấp nhận ước lượng.
--- - Pipeline-emitted metric sau mỗi run.
-CREATE OR REPLACE FUNCTION monitoring.orders_row_count()
-RETURNS bigint
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    row_count bigint;
-BEGIN
-    IF to_regclass('public.orders_production') IS NULL THEN
-        RETURN 0;
-    END IF;
-
-    EXECUTE '
-        SELECT COUNT(*)
-        FROM public.orders_production
-    ' INTO row_count;
-
-    RETURN COALESCE(row_count, 0);
-EXCEPTION WHEN others THEN
-    RETURN 0;
-END;
-$$;
-
--- ----------------------------------------------------------------------------
--- 6. Function kiểm tra data quality
--- ----------------------------------------------------------------------------
--- Đây là function nặng.
--- Lab chấp nhận vì dữ liệu nhỏ.
--- Production-grade thật: không scrape liên tục kiểu này trên bảng lớn.
-CREATE OR REPLACE FUNCTION monitoring.orders_quality_counts()
-RETURNS TABLE (
-    null_count bigint,
-    negative_amount_count bigint,
-    duplicate_order_id_groups bigint
-)
-LANGUAGE plpgsql
-VOLATILE
-AS $$
-BEGIN
-    IF to_regclass('public.orders_production') IS NULL THEN
-        RETURN QUERY
-        SELECT 0::bigint, 0::bigint, 0::bigint;
-        RETURN;
-    END IF;
-
-    RETURN QUERY EXECUTE $q$
-        SELECT
-            (
-                SELECT COUNT(*)
-                FROM public.orders_production
-                WHERE order_id IS NULL
-                   OR customer_id IS NULL
-                   OR amount IS NULL
-                   OR status IS NULL
-                   OR created_at IS NULL
-            ) AS null_count,
-            (
-                SELECT COUNT(*)
-                FROM public.orders_production
-                WHERE amount < 0
-            ) AS negative_amount_count,
-            (
-                SELECT COUNT(*)
-                FROM (
-                    SELECT order_id
-                    FROM public.orders_production
-                    GROUP BY order_id
-                    HAVING COUNT(*) > 1
-                ) duplicated_orders
-            ) AS duplicate_order_id_groups
-    $q$;
-EXCEPTION WHEN others THEN
-    -- Trả về giá trị sentinel để alert biết quality check không chạy được.
-    RETURN QUERY
-    SELECT 999999::bigint, 999999::bigint, 999999::bigint;
-END;
-$$;
-
--- ----------------------------------------------------------------------------
--- 7. Grants cho monitoring role
+-- 4. Grants cho monitoring role
 -- ----------------------------------------------------------------------------
 -- Monitoring cần:
 -- - USAGE trên schema.
--- - SELECT trên các bảng Data Plane để kiểm tra trạng thái.
+-- - SELECT trên các bảng Data Plane để kiểm tra trạng thái (cho future use).
 -- - EXECUTE trên monitoring functions.
 GRANT USAGE ON SCHEMA public TO monitoring;
 GRANT USAGE ON SCHEMA monitoring TO monitoring;
@@ -195,3 +98,22 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA monitoring TO monitoring;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA monitoring
 GRANT EXECUTE ON FUNCTIONS TO monitoring;
+
+-- ----------------------------------------------------------------------------
+-- NOTES FOR FUTURE PIPELINES:
+-- ----------------------------------------------------------------------------
+-- Khi thêm pipeline mới (customers, inventory, etc.), bạn KHÔNG cần thêm
+-- function nặng vào file này. Thay vào đó:
+--
+-- 1. Pipeline tự tính metric khi chạy xong
+-- 2. Pipeline push metric lên Pushgateway với naming convention:
+--    - dagster_pipeline_data_age_hours{pipeline_name="customers"}
+--    - dagster_pipeline_row_count{pipeline_name="customers"}
+--    - dagster_pipeline_quality_null_count{pipeline_name="customers"}
+--
+-- 3. Chỉ cần thêm lightweight function nếu cần metadata check
+--    (table exists, backup count, orphan count)
+--
+-- Đây là "Self-serve Observability" pattern: Data Engineer có thể add
+-- pipeline mới mà không cần Platform Engineer tạo monitoring function.
+-- ----------------------------------------------------------------------------

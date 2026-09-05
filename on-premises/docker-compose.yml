@@ -169,6 +169,11 @@ services:
       DATA_HEALTH_MIN_EXPECTED_ROWS: ${DATA_HEALTH_MIN_EXPECTED_ROWS:-1}
       DATA_HEALTH_MAX_AGE_HOURS: ${DATA_HEALTH_MAX_AGE_HOURS:-26}
 
+      # Observability: Pushgateway URL for pipeline-emitted metrics
+      # Pipeline sẽ push metrics lên đây sau khi chạy xong
+      # Default: pushgateway:9091 (Docker service DNS)
+      PROMETHEUS_PUSHGATEWAY_URL: ${PROMETHEUS_PUSHGATEWAY_URL:-pushgateway:9091}
+
     volumes:
       - dagster_storage:/opt/dagster/dagster_home
       - ./platform/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
@@ -242,6 +247,11 @@ services:
       # Optional data plane healthcheck settings
       DATA_HEALTH_MIN_EXPECTED_ROWS: ${DATA_HEALTH_MIN_EXPECTED_ROWS:-1}
       DATA_HEALTH_MAX_AGE_HOURS: ${DATA_HEALTH_MAX_AGE_HOURS:-26}
+
+      # Observability: Pushgateway URL for pipeline-emitted metrics
+      # Pipeline sẽ push metrics lên đây sau khi chạy xong
+      # Default: pushgateway:9091 (Docker service DNS)
+      PROMETHEUS_PUSHGATEWAY_URL: ${PROMETHEUS_PUSHGATEWAY_URL:-pushgateway:9091}
 
     volumes:
       - dagster_storage:/opt/dagster/dagster_home

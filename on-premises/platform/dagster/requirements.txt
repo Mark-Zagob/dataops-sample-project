@@ -11,5 +11,8 @@ cryptography==42.0.8   # BẮT BUỘC: PyMySQL cần nó để auth caching_sha2
 # Data Processing
 pandas==2.2.2           # Xử lý và transform dữ liệu
 
+# Observability (Pipeline-emitted Metrics)
+prometheus-client==0.21.0  # Push metrics to Pushgateway. KHÔNG scrape DB production.
+
 # Utilities
 python-dotenv==1.0.1    # Đọc file .env (chỉ dùng khi chạy local, không dùng trong Docker)

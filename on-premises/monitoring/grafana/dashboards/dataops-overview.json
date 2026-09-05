@@ -45,7 +45,7 @@
               },
               {
                 "color": "green",
-                "value": 6
+                "value": 7
               }
             ]
           }
@@ -151,11 +151,12 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Orders Data Age (hours)",
+      "title": "Orders Data Age (hours) - Pipeline Emitted",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Freshness metric được pipeline push lên Pushgateway sau khi swap. Data Plane KHÔNG BỊ CHẠM bởi monitoring.",
       "gridPos": {
         "h": 6,
         "w": 4,
@@ -164,7 +165,7 @@
       },
       "targets": [
         {
-          "expr": "orders_health_data_age_hours",
+          "expr": "dagster_pipeline_data_age_hours{pipeline_name=\"orders\"}",
           "refId": "A"
         }
       ],
@@ -185,6 +186,62 @@
               {
                 "color": "red",
                 "value": 28
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Orders Last Run Status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "1 = Success, 0 = Failed. Pipeline push metric này sau mỗi run.",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "dagster_pipeline_last_run_success{pipeline_name=\"orders\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "FAILED",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "SUCCESS",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
               }
             ]
           }
@@ -225,37 +282,213 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Orders Data Quality Issues",
+      "title": "Orders Data Quality Issues - Pipeline Emitted",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Data quality counts được pipeline check trên staging trước khi swap. KHÔNG query trực tiếp DB production.",
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 12,
         "x": 12,
         "y": 6
       },
       "targets": [
         {
-          "expr": "orders_quality_null_count",
+          "expr": "dagster_pipeline_quality_null_count{pipeline_name=\"orders\"}",
           "legendFormat": "null_count",
           "refId": "A"
         },
         {
-          "expr": "orders_quality_negative_amount_count",
+          "expr": "dagster_pipeline_quality_negative_count{pipeline_name=\"orders\"}",
           "legendFormat": "negative_amount_count",
           "refId": "B"
         },
         {
-          "expr": "orders_quality_duplicate_order_id_groups",
-          "legendFormat": "duplicate_order_id_groups",
+          "expr": "dagster_pipeline_quality_duplicate_count{pipeline_name=\"orders\"}",
+          "legendFormat": "duplicate_count",
           "refId": "C"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "none"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Orders Rows Processed (Last Run)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Số rows đã được pipeline load vào staging và swap lên production.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "expr": "dagster_pipeline_rows_processed{pipeline_name=\"orders\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Orders Swap Duration (Last Run)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Thời gian atomic swap (rename staging -> production). Nếu đột nhiên chậm 10x, có thể DB có vấn đề.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 14
+      },
+      "targets": [
+        {
+          "expr": "dagster_pipeline_swap_duration_seconds{pipeline_name=\"orders\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Orders Last Run Time",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Unix timestamp của lần chạy cuối cùng. Dùng để phát hiện pipeline ngừng chạy.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "expr": "dagster_pipeline_last_run_timestamp{pipeline_name=\"orders\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Orders Production Exists",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Metadata check từ postgres-exporter (lightweight query). 1 = table exists, 0 = missing.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 14
+      },
+      "targets": [
+        {
+          "expr": "orders_health_metadata_production_exists",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "MISSING",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "EXISTS",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       }

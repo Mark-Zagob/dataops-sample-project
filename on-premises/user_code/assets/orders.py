@@ -21,6 +21,7 @@ Các cải tiến chính trong phiên bản này:
 
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -43,6 +44,7 @@ from user_code.contracts.order_contract import (
     ORDERS_PIPELINE_LOCK_KEY,
     MIN_EXPECTED_ROWS,
 )
+from user_code.observability import PipelineMetricsEmitter
 
 
 # =================================================================
@@ -308,14 +310,23 @@ def validate_orders_schema(context: AssetExecutionContext) -> Dict[str, Any]:
     group_name="orders_pipeline",
     tags={"pipeline": "orders", "stage": "staging"},
 )
-def orders_staging(context: AssetExecutionContext) -> str:
+def orders_staging(context: AssetExecutionContext) -> Dict[str, Any]:
     """
     1. Extract dữ liệu từ MySQL.
     2. Cleanup staging orphan.
     3. Tạo bảng staging mới theo run.
     4. INSERT dữ liệu vào staging.
     5. Chạy data quality checks.
-    6. Trả về tên bảng staging cho asset production.
+    6. Trả về dict chứa staging table info và quality metrics.
+    
+    Return dict structure:
+    {
+        "staging_table": str,
+        "row_count": int,
+        "null_count": int,
+        "negative_amount_count": int,
+        "duplicate_count": int
+    }
     """
     staging_table = _run_scoped_staging_table(context.run_id)
 
@@ -500,6 +511,8 @@ def orders_staging(context: AssetExecutionContext) -> str:
             {
                 "staging_table": MetadataValue.text(staging_table),
                 "rows_loaded": MetadataValue.text(str(row_count)),
+                "null_count": MetadataValue.text(str(null_count)),
+                "negative_amount_count": MetadataValue.text(str(negative_count)),
                 "run_id": MetadataValue.text(context.run_id),
                 "pipeline_lock_key": MetadataValue.text(str(ORDERS_PIPELINE_LOCK_KEY)),
             }
@@ -511,7 +524,15 @@ def orders_staging(context: AssetExecutionContext) -> str:
             row_count,
         )
 
-        return staging_table
+        # Return dict chứa staging table info và quality metrics
+        # để asset orders_production có thể dùng cho metrics emission
+        return {
+            "staging_table": staging_table,
+            "row_count": row_count,
+            "null_count": null_count,
+            "negative_amount_count": negative_count,
+            "duplicate_count": 0,  # Đã check ở đầu pipeline, không có duplicate
+        }
 
     except (psycopg2.Error, ValueError) as e:
         pg_conn.rollback()
@@ -537,10 +558,10 @@ def orders_staging(context: AssetExecutionContext) -> str:
 )
 def orders_production(
     context: AssetExecutionContext,
-    orders_staging: str,
+    orders_staging: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Nhận tên bảng staging từ asset orders_staging.
+    Nhận dict từ asset orders_staging chứa staging table info và quality metrics.
 
     Thực hiện Atomic Swap trong một transaction:
 
@@ -549,12 +570,21 @@ def orders_production(
     3. Rename production hiện tại -> backup.
     4. Rename staging -> production.
     5. Commit.
+    6. Emit pipeline metrics lên Pushgateway.
 
     Trong phiên bản này, bảng backup được GIỮ LẠI một thế hệ để hỗ trợ
     phục hồi nhanh. Nếu bạn muốn theo đúng nguyên bản "DROP backup ngay
     sau swap", hãy uncomment đoạn DROP backup ở cuối transaction.
     """
-    staging_table = orders_staging
+    # Extract staging table info từ dict
+    staging_table = orders_staging["staging_table"]
+    row_count = orders_staging["row_count"]
+    quality_metrics = {
+        "null_count": orders_staging["null_count"],
+        "negative_amount_count": orders_staging["negative_amount_count"],
+        "duplicate_count": orders_staging["duplicate_count"],
+    }
+    
     backup_table = f"{PRODUCTION_TABLE_NAME}_backup"
 
     context.log.info(
@@ -564,6 +594,10 @@ def orders_production(
     )
 
     pg_conn = get_postgres_connection()
+    
+    # Track swap duration để emit metric
+    swap_start_time = time.time()
+    swap_duration_seconds = None
 
     try:
         with pg_conn.cursor() as cur:
@@ -641,6 +675,31 @@ def orders_production(
             # -----------------------------------------------------
 
         pg_conn.commit()
+        
+        # Calculate swap duration
+        swap_duration_seconds = time.time() - swap_start_time
+
+        # -----------------------------------------------------
+        # Calculate data_age_hours từ bảng production mới
+        # -----------------------------------------------------
+        # Pipeline tự tính age khi nó materialize data mới.
+        # Age chỉ có nghĩa khi có data mới.
+        # Đây là "compute once, emit once" pattern.
+        data_age_hours = None
+        try:
+            cur.execute(
+                """
+                SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) / 3600.0
+                FROM public.orders_production
+                """
+            )
+            result = cur.fetchone()[0]
+            if result is not None:
+                data_age_hours = float(result)
+        except Exception as e:
+            context.log.warning(
+                f"⚠️ Could not calculate data_age_hours: {e}"
+            )
 
         context.add_output_metadata(
             {
@@ -650,11 +709,35 @@ def orders_production(
                 "kept_backup_table": MetadataValue.text(
                     backup_table if production_existed else "none"
                 ),
+                "swap_duration_seconds": MetadataValue.text(
+                    f"{swap_duration_seconds:.2f}"
+                ),
+                "data_age_hours": MetadataValue.text(
+                    f"{data_age_hours:.2f}" if data_age_hours else "N/A"
+                ),
             }
         )
 
         context.log.info(
             "✅ Atomic Swap COMPLETED! Dữ liệu mới đã sẵn sàng cho CEO."
+        )
+        
+        # -----------------------------------------------------
+        # Emit pipeline metrics lên Pushgateway
+        # -----------------------------------------------------
+        # Pipeline-emitted metrics pattern: 
+        # - Pipeline tự tính metric khi chạy xong
+        # - Push lên Pushgateway (không scrape DB)
+        # - Data Plane KHÔNG BỊ CHẠM bởi monitoring
+        # - Blast radius: Pushgateway down → pipeline vẫn OK
+        emitter = PipelineMetricsEmitter()
+        emitter.emit_pipeline_success(
+            context=context,
+            pipeline_name="orders",
+            rows_processed=row_count,
+            data_age_hours=data_age_hours if data_age_hours is not None else 0.0,
+            swap_duration_seconds=swap_duration_seconds,
+            quality_metrics=quality_metrics,
         )
 
         return {
@@ -662,6 +745,8 @@ def orders_production(
             "production_table": PRODUCTION_TABLE_NAME,
             "staging_table_used": staging_table,
             "kept_backup_table": backup_table if production_existed else None,
+            "swap_duration_seconds": swap_duration_seconds,
+            "data_age_hours": data_age_hours,
         }
 
     except (psycopg2.Error, ValueError) as e:
@@ -670,6 +755,20 @@ def orders_production(
         context.log.info(
             "⏪ Transaction ROLLED BACK. Bảng production cũ vẫn an toàn nếu swap chưa commit."
         )
+        
+        # Emit failure metrics để alert biết pipeline đã fail
+        try:
+            emitter = PipelineMetricsEmitter()
+            emitter.emit_pipeline_failure(
+                context=context,
+                pipeline_name="orders",
+                error_message=str(e),
+            )
+        except Exception as emit_error:
+            context.log.warning(
+                f"⚠️ Could not emit failure metrics: {emit_error}"
+            )
+        
         raise
 
     finally:

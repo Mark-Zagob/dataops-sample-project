@@ -1,11 +1,16 @@
 # ============================================================================
-# DATAOPS ALERT RULES
+# DATAOPS ALERT RULES (Phase 1 - Pipeline-Emitted Metrics)
 # ============================================================================
 # Nguyên tắc:
 # - Alert khi cần hành động, không alert mọi thứ.
 # - Ưu tiên alert theo symptom và impact.
 # - Critical cho các lỗi ảnh hưởng trực tiếp đến data product/control plane.
 # - Warning cho operational hygiene.
+#
+# ARCHITECTURE CHANGE (Phase 1):
+# - Data quality, freshness metrics giờ đến từ Pushgateway (pipeline-emitted)
+# - Metadata metrics (table exists, orphan count) vẫn từ postgres-exporter
+# - Alert rules đã được update để query đúng source
 # ============================================================================
 
 groups:
@@ -113,13 +118,18 @@ groups:
           description: "More than one daemon heartbeat is active. Concurrency guarantees are at risk."
 
   # --------------------------------------------------------------------------
-  # Data Product / orders_production
+  # Data Product / orders_production (Pipeline-Emitted Metrics)
   # --------------------------------------------------------------------------
+  # METRICS SOURCE:
+  # - dagster_pipeline_* metrics đến từ Pushgateway (pipeline-emitted)
+  # - Pipeline push metrics sau khi swap thành công
+  # - Data Plane KHÔNG BỊ CHẠM bởi monitoring (decoupled observability)
   - name: dataops-data-product.rules
     rules:
 
+      # METADATA ALERT: Table existence (từ postgres-exporter, lightweight query)
       - alert: OrdersProductionMissing
-        expr: orders_health_production_exists == 0
+        expr: orders_health_metadata_production_exists == 0
         for: 10m
         labels:
           severity: warning
@@ -128,38 +138,42 @@ groups:
           summary: "orders_production table does not exist"
           description: "If first pipeline run has already happened, this is abnormal."
 
+      # FRESHNESS ALERT: Data age (từ Pushgateway, pipeline-emitted)
+      # Pipeline tự tính data_age_hours từ MAX(created_at) sau khi swap
       - alert: OrdersDataTooOldWarning
-        expr: orders_health_data_age_hours > 26
+        expr: dagster_pipeline_data_age_hours{pipeline_name="orders"} > 26
         for: 10m
         labels:
           severity: warning
           layer: data-product
         annotations:
           summary: "orders_production data is older than 26 hours"
-          description: "Business freshness threshold from contract is being exceeded."
+          description: "Business freshness threshold from contract is being exceeded. Pipeline may have failed or not run."
 
       - alert: OrdersDataTooOldCritical
-        expr: orders_health_data_age_hours > 28
+        expr: dagster_pipeline_data_age_hours{pipeline_name="orders"} > 28
         for: 10m
         labels:
           severity: critical
           layer: data-product
         annotations:
           summary: "orders_production data is critically stale"
-          description: "Executive dashboard may be misleading. Investigate pipeline/source."
+          description: "Executive dashboard may be misleading. Investigate pipeline/source immediately."
 
+      # QUALITY ALERTS: Data quality counts (từ Pushgateway, pipeline-emitted)
+      # Pipeline tự check quality trên staging trước khi swap
       - alert: OrdersQualityNullsDetected
-        expr: orders_quality_null_count > 0
+        expr: dagster_pipeline_quality_null_count{pipeline_name="orders"} > 0
         for: 5m
         labels:
           severity: critical
           layer: data-product
         annotations:
           summary: "NULL values detected in required order columns"
-          description: "Data product violates required fields contract."
+          description: "Data product violates required fields contract. Pipeline should have failed before swap."
 
       - alert: OrdersQualityNegativeAmountDetected
-        expr: orders_quality_negative_amount_count > 0
+        expr: dagster_pipeline_quality_negative_count{pipeline_name="orders"} > 0
         for: 5m
         labels:
           severity: critical
@@ -169,27 +183,53 @@ groups:
           description: "Business-invalid revenue data may corrupt analytics."
 
       - alert: OrdersQualityDuplicatesDetected
-        expr: orders_quality_duplicate_order_id_groups > 0
+        expr: dagster_pipeline_quality_duplicate_count{pipeline_name="orders"} > 0
         for: 5m
         labels:
           severity: critical
           layer: data-product
         annotations:
-          summary: "Duplicate order_id groups detected"
+          summary: "Duplicate primary keys detected"
           description: "Primary key semantics are violated."
 
+      # PIPELINE FAILURE ALERT: Last run failed
+      # Pipeline push success=0 khi có lỗi
+      - alert: OrdersPipelineLastRunFailed
+        expr: dagster_pipeline_last_run_success{pipeline_name="orders"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          layer: data-product
+        annotations:
+          summary: "Orders pipeline last run failed"
+          description: "Check Dagster UI for error details. Data may be stale."
+
+      # STALE METRICS ALERT: No recent run
+      # Nếu timestamp không cập nhật trong 25h, biết pipeline đã ngừng chạy
+      # (24h + 1h buffer để tránh false positive do clock skew)
+      - alert: OrdersPipelineNoRecentRun
+        expr: time() - dagster_pipeline_last_run_timestamp{pipeline_name="orders"} > 90000
+        for: 10m
+        labels:
+          severity: warning
+          layer: data-product
+        annotations:
+          summary: "Orders pipeline has not run in 25 hours"
+          description: "Pipeline may be stuck, disabled, or broken. Data will become stale soon."
+
+      # METADATA ALERTS: Backup and orphan tracking (từ postgres-exporter)
       - alert: OrdersStagingOrphanDetected
-        expr: orders_health_staging_orphan_count > 0
+        expr: orders_health_metadata_staging_orphan_count > 0
         for: 30m
         labels:
           severity: warning
           layer: data-product
         annotations:
           summary: "Run-scoped staging tables still exist"
-          description: "If no run is active, this may indicate orphan staging."
+          description: "If no run is active, this may indicate orphan staging tables that should have been cleaned up."
 
       - alert: OrdersBackupCountUnexpected
-        expr: orders_health_backup_count > 1
+        expr: orders_health_metadata_backup_count > 1
         for: 10m
         labels:
           severity: warning
